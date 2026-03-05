@@ -1,0 +1,28 @@
+
+models/
+dataset/
+outputs/
+# Hugging Face cache
+cache_for_HF/
+~/.cache/huggingface/
+
+# Python caches & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+ald-vlm/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# Test outputs
+*.log
+
+
+
