@@ -1,5 +1,6 @@
 
-models/
+models/CONCH/
+models/cache_for_HF/
 dataset/
 outputs/
 # Hugging Face cache
