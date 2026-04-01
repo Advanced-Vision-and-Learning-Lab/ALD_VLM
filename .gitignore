@@ -1,7 +1,7 @@
 
 models/CONCH/
 models/cache_for_HF/
-dataset/
+dataset/raw_wsis
 outputs/
 # Hugging Face cache
 cache_for_HF/
