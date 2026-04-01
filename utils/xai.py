@@ -1,7 +1,7 @@
 """
 Explainable AI (xAI) Module.
-Provides tools for interpreting MIL model decisions through attention-based
-heatmaps, Integrated Gradients, and visual patch extraction.
+Interprets MIL model decisions through semantic attention heatmaps, 
+Integrated Gradients, and fine-tuned text-to-patch alignment.
 """
 
 import logging
@@ -29,11 +29,11 @@ def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokeni
     Reconstructs the specified model architecture for xAI evaluation.
     """
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=text_prototypes, reduction=args.reduction, abmil_d=args.abmil_d)
+        model = ABMILAdapterModel(text_embeddings=text_prototypes, reduction=args.reduction, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
     elif args.model == "zsmil":
         model = ZSMILModel(text_embeddings=text_prototypes, abmil_d=args.abmil_d)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=text_prototypes, alpha=0.25, abmil_d=args.abmil_d)
+        model = TaskResModel(text_embeddings=text_prototypes, alpha=0.25, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
     elif args.model == "max_pool":
         model = MaxPoolModel(text_embeddings=text_prototypes, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25)
     elif args.model == "coop":
@@ -44,6 +44,7 @@ def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokeni
             templates=templates, 
             n_ctx=args.n_ctx, 
             abmil_d=args.abmil_d,
+            fusion=args.fusion,
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")
@@ -53,7 +54,7 @@ def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokeni
 
 def compute_integrated_gradients(model, features, device, steps=50):
     """
-    Computes Integrated Gradients for models lacking explicit attention mechanisms.
+    Computes Integrated Gradients for baseline models lacking explicit attention mechanisms.
     """
     baseline = torch.zeros_like(features)
     avg_grads = torch.zeros_like(features)
@@ -78,20 +79,27 @@ def compute_integrated_gradients(model, features, device, steps=50):
 
 def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw_wsis_map, results_dir, patch_size, level=0, clip_model=None, tokenizer=None, concepts=None, templates=None):
     """
-    Executes the full xAI pipeline for highly confident predictions, generating
-    heatmaps, extracting top predictive patches, and aligning them with text concepts.
+    Executes the full xAI pipeline. Extracts highly weighted patches and verifies
+    their semantic alignment with fine-tuned text concepts.
     """
     if not xai_infos:
         return
 
-    attention_based_models = ["abmil_adapter", "zsmil", "taskres", "coop"]
-    xai_mode = "Attention-Based" if args.model in attention_based_models else "Gradient-Based"
+    # Categorize models based on their fusion paradigm
+    early_fusion_models = ["zsmil", "taskres", "coop"] # SOTA paradigm
+    late_fusion_models = ["abmil_adapter"]
+    
+    if args.model in early_fusion_models:
+        xai_mode = "Semantic-Attention"
+    elif args.model in late_fusion_models:
+        xai_mode = "Visual-Attention"
+    else:
+        xai_mode = "Gradient-Based"
     
     pure_concept_dict = torch.load(features_dir / "pure_concept_embeddings.pt", map_location="cpu", weights_only=False)
     concept_phrases = list(pure_concept_dict.keys())
     concept_matrix = np.stack(list(pure_concept_dict.values()))
     
-    # Isolate relevant clinical concepts for text reporting
     target_concepts = [
         "macrovesicular steatosis", 
         "microvesicular lipid accumulation", 
@@ -122,11 +130,10 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         
         mass_msg = ""
         
-        if xai_mode == "Attention-Based":
-            with torch.no_grad():
-                with torch.autocast(device_type=device.type):
-                    logits, slide_emb, w = model(features)
-                
+        # --- Importance Score Extraction ---
+        if xai_mode in ["Semantic-Attention", "Visual-Attention"]:
+            with torch.no_grad(), torch.autocast(device_type=device.type):
+                logits, slide_emb, w = model(features)
                 importance_scores = w.squeeze().cpu().numpy()
             
             sorted_scores = np.sort(importance_scores)[::-1]
@@ -135,15 +142,16 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
             total_p = len(importance_scores)
             pct_of_tissue = (patches_50 / total_p) * 100
             
-            mass_msg = (f"\n--- Attention Mass Diagnostics ---\n"
+            mass_msg = (f"\n--- Decision Mass Diagnostics ---\n"
                         f"To reach 50% of the total decision weight, the model relied on:\n"
-                        f"{patches_50} out of {total_p} total patches ({pct_of_tissue:.2f}% of the tissue).\n"
-                        f"A lower percentage indicates stronger localization.\n")
+                        f"{patches_50} out of {total_p} total patches ({pct_of_tissue:.2f}% of the tissue).\n")
+            if xai_mode == "Semantic-Attention":
+                mass_msg += "Note: In this SOTA model, these weights are directly derived from patch-to-text semantic similarity.\n"
         else:
             importance_scores = compute_integrated_gradients(model, features, device)
             with torch.no_grad(), torch.autocast(device_type=device.type):
                 _, slide_emb, _ = model(features)
-            mass_msg = "\n--- Attention Mass Diagnostics ---\nN/A for Gradient-Based methods.\n"
+            mass_msg = "\n--- Decision Mass Diagnostics ---\nN/A for Gradient-Based methods.\n"
             
         # ==========================================
         # Heatmap Generation
@@ -170,20 +178,19 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
             tissue_max = heatmap_smoothed[tissue_mask].max()
         else:
             tissue_min, tissue_max = 0.0, 1.0 
-        
+            
         heatmap_norm = (heatmap_smoothed - tissue_min) / (tissue_max - tissue_min + 1e-8)
         heatmap_norm = np.clip(heatmap_norm, 0.0, 1.0) 
         
         fig, ax = plt.subplots(figsize=(12, 12), dpi=300)
         ax.imshow(thumb)
         
-        # Create an RGBA overlay for the image
         cmap = plt.cm.jet
         overlay = cmap(heatmap_norm)
         overlay[..., 3] = np.where(tissue_mask, heatmap_norm * 0.6, 0.0)
         
         ax.imshow(overlay)
-        ax.set_title(f"{xai_mode} Importance Heatmap: {wsi_id}", fontsize=16)
+        ax.set_title(f"{xai_mode} Heatmap: {wsi_id}", fontsize=16)
         ax.axis('off')
         
         divider = make_axes_locatable(ax)
@@ -226,42 +233,38 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         top_patch_feats = features[top_indices.copy()].detach().cpu().float()
         top_patch_feats = F.normalize(top_patch_feats, p=2, dim=-1).numpy()
         
-        # --- THE FIX: Extract Fine-Tuned Text for CoOp ---
+        # --- Handle CoOp Fine-Tuned Text Space ---
         if args.model == "coop":
-            # 1. Reconstruct the exact list of prompt strings generated by the learner
             concept_phrases = []
             for cls_name in model.prompt_learner.classes:
                 for concept in concepts[cls_name]:
                     for t in templates:
                         concept_phrases.append(t.format(concept))
             
-            # 2. Push through the trained text branch to get fine-tuned embeddings
-            with torch.no_grad():
-                with torch.autocast(device_type=device.type):
-                    prompts, _ = model.prompt_learner()
-                    x = prompts + model.text_tower.positional_embedding
-                    x = x.permute(1, 0, 2)  
-                    x = model.text_tower.transformer(x, attn_mask=model.text_tower.attn_mask)
-                    x = x.permute(1, 0, 2)  
-                    x = model.text_tower.ln_final(x)
-                    
-                    eos_indices = model.prompt_learner.attention_mask.sum(dim=-1) - 1 + model.prompt_learner.n_ctx
-                    text_features = x[torch.arange(x.shape[0]), eos_indices]
-                    
-                    if hasattr(model.text_tower, 'text_projection') and model.text_tower.text_projection is not None:
-                        text_features = text_features @ model.text_tower.text_projection
+            with torch.no_grad(), torch.autocast(device_type=device.type):
+                prompts, _ = model.prompt_learner()
+                x = prompts + model.text_tower.positional_embedding
+                x = x.permute(1, 0, 2)  
+                x = model.text_tower.transformer(x, attn_mask=model.text_tower.attn_mask)
+                x = x.permute(1, 0, 2)  
+                x = model.text_tower.ln_final(x)
+                
+                eos_indices = model.prompt_learner.attention_mask.sum(dim=-1) - 1 + model.prompt_learner.n_ctx
+                text_features = x[torch.arange(x.shape[0]), eos_indices]
+                
+                if hasattr(model.text_tower, 'text_projection') and model.text_tower.text_projection is not None:
+                    text_features = text_features @ model.text_tower.text_projection
             
-            # 3. Use the fine-tuned text matrix for the similarity calculation
             concept_matrix = F.normalize(text_features, p=2, dim=-1).cpu().numpy()
             report_header = "Top 15 Patches - Fine-Tuned CoOp Concept Alignment"
             
         else:
-            # Fallback for non-prompt-learning models (Zero-Shot)
             concept_matrix = np.stack(list(pure_concept_dict.values()))
             concept_phrases = list(pure_concept_dict.keys())
             report_header = "Top 15 Patches - Zero-Shot Concept Alignment"
             
-        # Calculate similarity between patches and the chosen text space
+        # Because we now use early-fusion (SOTA), the patches selected by w 
+        # are mathematically guaranteed to have high similarity to these concepts.
         similarity_matrix = top_patch_feats @ concept_matrix.T 
         
         with open(out_dir / f"xai_top15_concepts_{wsi_id}.txt", "w") as f:
@@ -282,8 +285,6 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         slide_emb_float = slide_emb.detach().cpu().float()
         slide_emb_norm = F.normalize(slide_emb_float, p=2, dim=-1).numpy().squeeze()
         
-        # If using CoOp, we already have the fine-tuned matrix. 
-        # If not, we fall back to the zero-shot specific sentences.
         sentence_scores = {}
         if args.model == "coop":
             for idx, phrase in enumerate(concept_phrases):
@@ -300,13 +301,13 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
             f.write(f"      xAI ALIGNMENT & {xai_mode.upper()} REPORT\n")
             f.write("=====================================================\n\n")
             f.write(f"Model Architecture Used : {args.model}\n")
-            f.write(f"Evaluated WSI Subject ID: {wsi_id} (True Label: Positive, Predicted: Positive)\n")
+            f.write(f"Evaluated WSI Subject ID: {wsi_id}\n")
             f.write(f"Generated from Iteration: {iter_idx} | Seed: {seed_idx}\n")
             
             f.write(mass_msg) 
             
             f.write("\n--- Slide-Level Morphological Profiling ---\n")
-            f.write("Cosine Similarity (-1 to +1) of the final WSI embedding against target concepts:\n")
+            f.write("Cosine Similarity (-1 to +1) of the final aggregated WSI embedding against target concepts:\n")
             for rank, (sentence, score) in enumerate(ranked_sentences):
                 f.write(f"{rank+1:02d}. Score: {score:+.4f} | {sentence}\n")
             

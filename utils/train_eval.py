@@ -18,6 +18,7 @@ from tqdm import tqdm
 import sklearn.metrics
 import openslide
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+import matplotlib.pyplot as plt
 
 from .mil_models import (
     ABMILAdapterModel, 
@@ -211,11 +212,11 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
     
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=text_prototypes, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
+        model = ABMILAdapterModel(text_embeddings=text_prototypes, reduction=args.reduction, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
     elif args.model == "zsmil":
         model = ZSMILModel(text_embeddings=text_prototypes, abmil_d=args.abmil_d).to(device)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=text_prototypes, alpha=0.25, abmil_d=args.abmil_d).to(device)
+        model = TaskResModel(text_embeddings=text_prototypes, alpha=0.25, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
     elif args.model == "max_pool":
         model = MaxPoolModel(text_embeddings=text_prototypes, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25).to(device)
     elif args.model == "coop":
@@ -226,6 +227,7 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
             templates=templates, 
             n_ctx=args.n_ctx, 
             abmil_d=args.abmil_d,
+            fusion=args.fusion,
         ).to(device)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
@@ -318,3 +320,43 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     eval_ids = val_ids + test_ids
     
     return best_val_bacc, test_bacc, stopped_epoch, eval_probs, eval_preds, eval_ids, best_weights, history
+    
+    
+def plot_and_save_curves(history, save_dir, iter_idx, seed_idx):
+    """Generates and saves visual training/validation loss and accuracy curves."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    epochs = range(1, len(history['train_loss']) + 1)
+    best_epoch = np.argmin(history['val_loss']) + 1
+    
+    # --- Plot Loss ---
+    plt.figure(figsize=(8, 5), dpi=300)
+    plt.plot(epochs, history['train_loss'], label='Train Loss', color='blue', linewidth=2)
+    plt.plot(epochs, history['val_loss'], label='Validation Loss', color='orange', linewidth=2, linestyle='--')
+    plt.axvline(x=best_epoch, color='black', linestyle=':', linewidth=1.5, alpha=0.7, label=f'Best Epoch ({best_epoch})')
+    plt.title(f"Loss Curve - Iteration {iter_idx} (Seed {seed_idx})", fontsize=16)
+    plt.xlabel("Epochs", fontsize=14)
+    plt.ylabel("Cross-Entropy Loss", fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / f"loss_curve_iter{iter_idx}_seed{seed_idx}.png")
+    plt.close()
+    
+    # --- Plot Accuracy ---
+    plt.figure(figsize=(8, 5), dpi=300)
+    plt.plot(epochs, history['train_bacc'], label='Train Balanced Accuracy', color='green', linewidth=2)
+    plt.plot(epochs, history['val_bacc'], label='Validation Balanced Accuracy', color='red', linewidth=2, linestyle='--')
+    plt.axvline(x=best_epoch, color='black', linestyle=':', linewidth=1.5, alpha=0.7, label=f'Best Epoch ({best_epoch})')
+    plt.title(f"Accuracy Curve - Iteration {iter_idx} (Seed {seed_idx})", fontsize=16)
+    plt.xlabel("Epochs", fontsize=14)
+    plt.ylabel("Balanced Accuracy", fontsize=14)
+    plt.ylim(0, 1.05)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / f"acc_curve_iter{iter_idx}_seed{seed_idx}.png")
+    plt.close()    

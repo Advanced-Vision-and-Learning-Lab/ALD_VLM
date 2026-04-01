@@ -23,7 +23,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # Internal utility imports
-from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold
+from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold, plot_and_save_curves
 from utils.xai import run_xai_analysis
 
 # ==========================================
@@ -296,6 +296,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "coop"], default="abmil_adapter")
+    parser.add_argument('--fusion', type=str, choices=["visual", "semantic"], default="semantic", help="Late fusion (visual) vs early fusion (semantic)")
     parser.add_argument('--n_ctx', type=int, default=16, help="Learnable context tokens (CoOp only).")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
@@ -378,15 +379,18 @@ if __name__ == "__main__":
     SHARED_SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_JSON_PATH = SHARED_SPLITS_DIR / f"dataset_splits_{args.shots}shot_{args.iterations}iter_{int(args.dataset_pct*100)}pct.json"
     
-    if args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}"
+    if args.model == "abmil_adapter": model_str = f"{args.model}_{args.fusion}_r{args.reduction}_d{args.abmil_d}"
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}"
-    elif args.model == "coop": model_str = f"{args.model}_ctx{args.n_ctx}_d{args.abmil_d}"
-    else: model_str = f"{args.model}_d{args.abmil_d}"
+    elif args.model == "coop": model_str = f"{args.model}_{args.fusion}_ctx{args.n_ctx}_d{args.abmil_d}"
+    else: model_str = f"{args.model}_{args.fusion}_d{args.abmil_d}"
         
     DYNAMIC_RESULTS_DIR = STANDALONE_DIR / f"{model_str}_{args.shots}shot_{args.iterations}iter"
     PROBS_DIR = DYNAMIC_RESULTS_DIR / "test_probabilities" 
+    CURVES_DIR = DYNAMIC_RESULTS_DIR / "training_curves" # Added this
+    
     DYNAMIC_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     PROBS_DIR.mkdir(parents=True, exist_ok=True)
+    CURVES_DIR.mkdir(parents=True, exist_ok=True) 
 
     clip_model, tokenizer = None, None
     if args.model == "coop":
@@ -428,6 +432,46 @@ if __name__ == "__main__":
                 concepts=CONCEPTS, templates=TEMPLATES
             )
 
+            # --- RESTORED: Probability Reporting ---
+            txt_lines = [
+                "============================================================",
+                "               EVALUATION PROBABILITY REPORT",
+                "============================================================",
+                f"Iteration : {fold_idx}",
+                f"Seed      : {n_seed}",
+                f"Model     : {args.model.upper()} ({args.fusion} fusion)",
+                f"Shots     : {args.shots}",
+                "------------------------------------------------------------",
+                f"Train Subjects: {', '.join(train_ids)}",
+                f"Val Subjects  : {', '.join(val_ids)}",
+                "============================================================",
+                f"{'Subject ID':<15} | {'True Label':<15} | {'Pred Label':<15} | {'Correct':<8} | {'Prob(Drinking)':<15} | {'Confidence'}",
+                "------------------------------------------------------------"
+            ]
+            
+            for subj in eval_ids:
+                true_label = 1 if subj in D_POOL else 0
+                pred_label = eval_preds.get(subj, -1)
+                prob = eval_probs.get(subj, -1.0)
+                if prob == -1.0: conf_str = "ERROR"
+                elif prob >= 0.8 or prob <= 0.2: conf_str = "High"
+                elif prob >= 0.6 or prob <= 0.4: conf_str = "Medium"
+                else: conf_str = "Low"
+                
+                t_class = "Drinking" if true_label == 1 else "Non-Drinking"
+                p_class = "Drinking" if pred_label == 1 else "Non-Drinking"
+                correct = "Yes" if true_label == pred_label else "No"
+                
+                txt_lines.append(f"{subj:<15} | {t_class:<15} | {p_class:<15} | {correct:<8} | {prob:<15.4f} | {conf_str}")
+
+            txt_lines.append("============================================================")
+            
+            with open(PROBS_DIR / f"iter{fold_idx:02d}_seed{n_seed}.txt", "w") as f:
+                f.write("\n".join(txt_lines))
+
+            # --- RESTORED: Training Curve Plotting ---
+            plot_and_save_curves(history, CURVES_DIR, fold_idx, n_seed)
+
             fold_val_bacc.append(val_bacc)
             fold_test_bacc.append(test_bacc)
             fold_epochs.append(stopped_epoch)
@@ -451,20 +495,25 @@ if __name__ == "__main__":
         test_baccs.append(avg_test_bacc)
         all_epochs.append(avg_epochs)
         
-        log_str = (f"Fold {fold_idx:02d} | "
-                   f"Epochs: {avg_epochs:.1f} | "
-                   f"Val BACC: {avg_val_bacc:.4f} | "
-                   f"Test BACC: {avg_test_bacc:.4f}")
+        log_str = (f"Iter {fold_idx:02d}/{args.iterations} | Train:[{','.join(train_ids)}] "
+                   f"Val:[{','.join(val_ids)}] Test:[{len(test_ids)} subjects] | "
+                   f"Epochs: {avg_epochs:.1f}±{std_epochs:.1f} | "
+                   f"Val BACC: {avg_val_bacc:.4f}±{std_val_bacc:.4f} | "
+                   f"Test BACC: {avg_test_bacc:.4f}±{std_test_bacc:.4f}")
         logging.info(log_str)
+        combo_report_logs.append(f"Iter {fold_idx:02d}: Train:[{','.join(train_ids)}] | Test Subjects: [{len(test_ids)}] -> Test BACC: {avg_test_bacc:.4f} ± {std_test_bacc:.4f}")
             
+    # --- RESTORED: Expanded Final Summary ---
     summary = (
-        f"\n{'='*80}\nEVALUATION SUMMARY: {args.model.upper()} ({args.shots}-Shot)\n{'='*80}\n"
+        f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - {args.fusion} fusion - {args.shots} Shot)\n{'='*80}\n"
+        f"Average Epochs: {np.mean(all_epochs):.1f} ± {np.std(all_epochs):.1f}\n{'='*80}\n"
+        f"INDIVIDUAL COMBO DETAILS:\n" + "\n".join(combo_report_logs) + f"\n{'='*80}\n"
+        f"OVERALL METRICS (Mean of {args.iterations} Iterations):\n"
         f"Validation BACC: {np.mean(val_baccs):.4f} ± {np.std(val_baccs):.4f}\n"
-        f"Test BACC:       {np.mean(test_baccs):.4f} ± {np.std(test_baccs):.4f}\n{'='*80}"
+        f"Test BACC:        {np.mean(test_baccs):.4f} ± {np.std(test_baccs):.4f}\n{'='*80}"
     )
     print(summary)
     with open(DYNAMIC_RESULTS_DIR / f"summary_metrics.txt", "w") as f: f.write(summary)
-
     # Run downstream explainability
     if xai_infos:
         run_xai_analysis(
