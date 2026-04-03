@@ -42,8 +42,8 @@ def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokeni
         model = PromptLearningMILModel(
             clip_model=clip_model, 
             tokenizer=tokenizer, 
-            concepts_dict=concepts, 
-            templates=templates, 
+            concepts_dict=instance_concepts, 
+            templates=instance_templates,    
             n_ctx=args.n_ctx, 
             abmil_d=args.abmil_d,
             fusion=args.fusion,
@@ -290,8 +290,6 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
             concept_phrases = list(pure_concept_dict.keys())
             report_header = "Top 15 Patches - Zero-Shot Concept Alignment"
             
-        # Because we now use early-fusion, the patches selected by w 
-        # are mathematically guaranteed to have high similarity to these concepts.
         similarity_matrix = top_patch_feats @ concept_matrix.T 
         
         with open(out_dir / f"xai_top15_concepts_{wsi_id}.txt", "w") as f:
