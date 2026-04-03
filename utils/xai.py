@@ -169,7 +169,7 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
                         f"To reach 50% of the total decision weight, the model relied on:\n"
                         f"{patches_50} out of {total_p} total patches ({pct_of_tissue:.2f}% of the tissue).\n")
             if xai_mode == "Semantic-Attention":
-                mass_msg += "Note: In this SOTA model, these weights are directly derived from patch-to-text semantic similarity.\n"
+                mass_msg += "Note: In this model, these weights are directly derived from patch-to-text semantic similarity.\n"
         else:
             importance_scores = compute_integrated_gradients(model, features, device)
             with torch.no_grad(), torch.autocast(device_type=device.type):
@@ -290,7 +290,7 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
             concept_phrases = list(pure_concept_dict.keys())
             report_header = "Top 15 Patches - Zero-Shot Concept Alignment"
             
-        # Because we now use early-fusion (SOTA), the patches selected by w 
+        # Because we now use early-fusion, the patches selected by w 
         # are mathematically guaranteed to have high similarity to these concepts.
         similarity_matrix = top_patch_feats @ concept_matrix.T 
         

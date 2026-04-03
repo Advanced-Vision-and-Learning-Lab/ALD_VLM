@@ -173,14 +173,13 @@ class DynamicWSIDataset(Dataset):
         )
         return data["features"], self.label_map[data["binary_category"]], self.subject_ids[idx]
 
-
 def evaluate(model, loader, device, criterion):
     """
     Evaluates the model on a given dataloader.
-    Returns average loss, balanced accuracy, and predictions.
+    Returns average loss, BACC, AUC, F1, and predictions.
     """
     model.eval()
-    preds, targets = [], []
+    preds, targets, prob_list = [], [], []
     subject_preds = {}
     subject_probs = {} 
     run_loss = 0.0
@@ -199,6 +198,7 @@ def evaluate(model, loader, device, criterion):
             pred = 1 if prob_drinking >= 0.5 else 0
             preds.append(pred)
             targets.append(label.item())
+            prob_list.append(prob_drinking) # Captured for AUC
             
             subj_id = subj_ids[0]
             subject_preds[subj_id] = pred
@@ -206,7 +206,14 @@ def evaluate(model, loader, device, criterion):
             
     avg_loss = run_loss / len(loader.dataset)
     bacc = sklearn.metrics.balanced_accuracy_score(targets, preds)
-    return avg_loss, bacc, subject_preds, subject_probs
+    f1 = sklearn.metrics.f1_score(targets, preds, zero_division=0)
+    
+    try:
+        auc = sklearn.metrics.roc_auc_score(targets, prob_list)
+    except ValueError:
+        auc = 0.5000 
+        
+    return avg_loss, bacc, auc, f1, subject_preds, subject_probs
        
     
 def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, args, features_dir, clip_model=None, tokenizer=None, bag_concepts=None, instance_concepts=None, bag_templates=None, instance_templates=None):
@@ -229,8 +236,8 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
         model = PromptLearningMILModel(
             clip_model=clip_model, 
             tokenizer=tokenizer, 
-            concepts_dict=concepts, 
-            templates=templates, 
+            concepts_dict=instance_concepts,  
+            templates=instance_templates,    
             n_ctx=args.n_ctx, 
             abmil_d=args.abmil_d,
             fusion=args.fusion,
@@ -306,8 +313,8 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
         if not skip_lr_sched:
             scheduler.step()
         
-        train_loss, train_bacc, _, _ = evaluate(model, train_loader, device, criterion)
-        val_loss, val_bacc, _, _ = evaluate(model, val_loader, device, criterion)
+        train_loss, train_bacc, _, _, _, _ = evaluate(model, train_loader, device, criterion)
+        val_loss, val_bacc, _, _, _, _ = evaluate(model, val_loader, device, criterion)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -330,15 +337,14 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     if best_weights is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_weights.items()})
     
-    _, _, val_preds, val_probs = evaluate(model, val_loader, device, criterion)
-    test_loss, test_bacc, test_preds, test_probs = evaluate(model, test_loader, device, criterion)
+    _, _, _, _, val_preds, val_probs = evaluate(model, val_loader, device, criterion)
+    test_loss, test_bacc, test_auc, test_f1, test_preds, test_probs = evaluate(model, test_loader, device, criterion)
     
     eval_preds = {**val_preds, **test_preds}
-    eval_probs = {**val_probs, **test_probs} 
+    eval_probs = {**val_probs, **test_probs}
     eval_ids = val_ids + test_ids
     
-    return best_val_bacc, test_bacc, stopped_epoch, eval_probs, eval_preds, eval_ids, best_weights, history
-    
+    return best_val_bacc, test_bacc, test_auc, test_f1, stopped_epoch, eval_probs, eval_preds, eval_ids, best_weights, history
     
 def plot_and_save_curves(history, save_dir, iter_idx, seed_idx):
     """Generates and saves visual training/validation loss and accuracy curves."""

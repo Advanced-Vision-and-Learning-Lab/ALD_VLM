@@ -50,41 +50,42 @@ os.environ.setdefault("HF_HOME", str(CACHE_DIR))
 if CACHE_DIR.exists() and any(CACHE_DIR.iterdir()):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
-    
+
 INSTANCE_TEMPLATES = [
     "A high-magnification H&E stained liver tissue patch exhibiting {}.", 
-    "A detailed microscopic pathology view revealing {}."
+    "A microscopic pathology view revealing {}."
 ]
+
+INSTANCE_CONCEPTS = {
+    "Healthy Liver": [
+        "orderly cords of normal hepatocytes", 
+        "uniform hepatocytes with dense granular eosinophilic cytoplasm", 
+        "centrally located hepatocyte nuclei with smooth nuclear contours", 
+        "clear hepatic sinusoids lined by thin endothelial cells", 
+        "structurally intact portal tracts with normal bile ducts and vessels"
+    ],
+    "Alcoholic Liver Disease": [
+        "macrovesicular steatosis with large lipid droplets", 
+        "microvesicular steatosis with foamy hepatocyte cytoplasm", 
+        "hepatocyte ballooning degeneration with cellular swelling",
+        "Mallory-Denk bodies within degenerating hepatocytes", 
+        "neutrophilic lobular inflammation", 
+        "perisinusoidal bridging fibrosis" 
+    ]
+}
 
 BAG_TEMPLATES = [
     "A comprehensive whole slide image pathology diagnosis indicating {}."
 ]
 
-INSTANCE_CONCEPTS = {
-    "Healthy Liver": [
-        "perfectly orderly cords of normal hepatocytes radiating from a pristine central vein", 
-        "uniform, healthy hepatocytes with granular eosinophilic cytoplasm and distinct nuclei without lipid droplets", 
-        "radiating hepatic sinusoids lined by intact endothelial cells lacking inflammatory infiltrates", 
-        "clean and intact portal tracts containing regular bile ducts, hepatic arteries, and portal veins", 
-        "normal central vein architecture with no perivenular fibrosis or collagen deposition"
-    ],
-    "Alcoholic Liver Disease": [
-        "prominent macrovesicular steatosis where large lipid droplets completely displace hepatocyte nuclei", 
-        "extensive microvesicular lipid accumulation giving hepatocytes a foamy appearance", 
-        "classic hepatocyte ballooning degeneration with cellular swelling and Mallory-Denk body formation", 
-        "dense neutrophilic lobular inflammation forming microabscesses around degenerating hepatocytes", 
-        "distinct perisinusoidal and pericellular fibrosis creating a classic chicken-wire pattern of collagen deposition"
-    ]
-}
-
 BAG_CONCEPTS = {
     "Healthy Liver": [
-        "normal liver architecture with no signs of chronic alcohol consumption", 
-        "healthy hepatic tissue lacking steatosis, ballooning, or significant inflammation"
+        "normal liver architecture with preserved lobular structure",
+        "healthy hepatic tissue with intact portal and central vein relationships" 
     ],
     "Alcoholic Liver Disease": [
-        "severe Alcoholic Liver Disease characterized by widespread steatosis and lobular inflammation", 
-        "chronic Alcoholic Liver Disease with established bridging fibrosis and hepatocyte ballooning"
+        "steatohepatitis with concurrent steatosis, inflammation, and cellular injury",
+        "chronic liver disease characterized by widespread steatosis and lobular inflammation"
     ]
 }
 
@@ -430,7 +431,7 @@ if __name__ == "__main__":
     run_feature_extraction(device, valid_subjects, SUBJECT_META)
     text_prototypes = np.load(FEATURES_DIR / "text_prototypes.npy")
     
-    val_baccs, test_baccs, combo_report_logs, all_epochs, xai_infos = [], [], [], [], []
+    val_baccs, test_baccs, test_aucs, test_f1s, combo_report_logs, all_epochs, xai_infos = [], [], [], [], [], [], []
     dataset_splits = load_or_create_splits(SPLITS_JSON_PATH, args.shots, ND_POOL, D_POOL, SUBJECT_META, args.iterations)
     
     logging.info(f"Initiating Few-Shot Evaluation: {args.model.upper()} | {args.shots} Shots")
@@ -444,7 +445,8 @@ if __name__ == "__main__":
         for n_seed in range(args.seeds):
             set_seed(n_seed)
 
-            val_bacc, test_bacc, stopped_epoch, eval_probs, eval_preds, eval_ids, b_weights, history = train_and_eval_fold(
+
+            val_bacc, test_bacc, test_auc, test_f1, stopped_epoch, eval_probs, eval_preds, eval_ids, b_weights, history = train_and_eval_fold(
                 train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
                 text_prototypes=text_prototypes, device=device, args=args,
                 features_dir=FEATURES_DIR, clip_model=clip_model, tokenizer=tokenizer, 
@@ -490,12 +492,13 @@ if __name__ == "__main__":
             with open(PROBS_DIR / f"iter{fold_idx:02d}_seed{n_seed}.txt", "w") as f:
                 f.write("\n".join(txt_lines))
 
-            # --- RESTORED: Training Curve Plotting ---
             plot_and_save_curves(history, CURVES_DIR, fold_idx, n_seed)
 
             fold_val_bacc.append(val_bacc)
             fold_test_bacc.append(test_bacc)
             fold_epochs.append(stopped_epoch)
+            test_aucs.append(test_auc) # New
+            test_f1s.append(test_f1)   # New
             
             # Queue confident predictions for interpretation analysis
             if fold_idx == 1 and n_seed == 0:
@@ -524,14 +527,15 @@ if __name__ == "__main__":
         logging.info(log_str)
         combo_report_logs.append(f"Iter {fold_idx:02d}: Train:[{','.join(train_ids)}] | Test Subjects: [{len(test_ids)}] -> Test BACC: {avg_test_bacc:.4f} ± {std_test_bacc:.4f}")
             
-    # --- RESTORED: Expanded Final Summary ---
     summary = (
         f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - {args.fusion} fusion - {args.shots} Shot)\n{'='*80}\n"
         f"Average Epochs: {np.mean(all_epochs):.1f} ± {np.std(all_epochs):.1f}\n{'='*80}\n"
         f"INDIVIDUAL COMBO DETAILS:\n" + "\n".join(combo_report_logs) + f"\n{'='*80}\n"
         f"OVERALL METRICS (Mean of {args.iterations} Iterations):\n"
         f"Validation BACC: {np.mean(val_baccs):.4f} ± {np.std(val_baccs):.4f}\n"
-        f"Test BACC:        {np.mean(test_baccs):.4f} ± {np.std(test_baccs):.4f}\n{'='*80}"
+        f"Test BACC:       {np.mean(test_baccs):.4f} ± {np.std(test_baccs):.4f}\n"
+        f"Test AUC-ROC:    {np.mean(test_aucs):.4f} ± {np.std(test_aucs):.4f}\n"
+        f"Test F1-Score:   {np.mean(test_f1s):.4f} ± {np.std(test_f1s):.4f}\n{'='*80}"
     )
     print(summary)
     with open(DYNAMIC_RESULTS_DIR / f"summary_metrics.txt", "w") as f: f.write(summary)
