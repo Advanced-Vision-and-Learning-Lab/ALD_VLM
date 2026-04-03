@@ -1,4 +1,5 @@
 """
+train_eval.py
 Training, Evaluation, and Dataset Modules.
 Provides utilities for dataset handling, stratified splitting, 
 and the main training/validation loops for the MIL models.
@@ -237,6 +238,8 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
     
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    criterion = torch.nn.CrossEntropyLoss(reduction="sum")
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     criterion = torch.nn.CrossEntropyLoss(reduction="sum")
     

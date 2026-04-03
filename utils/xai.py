@@ -1,4 +1,5 @@
 """
+xai.py
 Explainable AI (xAI) Module.
 Interprets MIL model decisions through semantic attention heatmaps, 
 Integrated Gradients, and fine-tuned text-to-patch alignment.

@@ -1,4 +1,5 @@
 """
+demo.py
 Few-Shot Multiple Instance Learning (MIL) Evaluation Pipeline.
 Main execution script for WSI processing, feature extraction, and model training.
 """

@@ -1,4 +1,5 @@
 """
+mil_models.py
 Multiple Instance Learning (MIL) Model Architectures.
 """
 
@@ -48,7 +49,6 @@ class MaxPoolModel(nn.Module):
         self.head_type = head_type
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
-
         if self.head_type == "adapter":
             self.reduction = reduction
             self.ratio = 0.2
@@ -207,7 +207,6 @@ class ZSMILModel(nn.Module):
         self.fusion = fusion
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
-        
         if self.fusion == "visual":
             self.aggregator = ABMIL(L=512, D=abmil_d)
         else:
