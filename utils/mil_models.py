@@ -338,3 +338,65 @@ class PromptLearningMILModel(nn.Module):
         logits = logits * clamped_scale
         
         return logits, slide_emb_norm, w
+        
+class TOPModel(nn.Module):
+    """
+    TOP Multiple Instance Learning Model.
+    Utilizes dual prompt learners: one for instance-level attention (patch pooling) 
+    and one for bag-level classification (WSI diagnosis).
+    """
+    def __init__(self, clip_model, tokenizer, bag_concepts_dict, instance_concepts_dict, bag_templates, instance_templates, n_ctx=16):
+        super().__init__()
+        # Dual Prompt Learners
+        self.bag_learner = CoOpPromptLearner(bag_concepts_dict, bag_templates, clip_model, tokenizer, n_ctx)
+        self.instance_learner = CoOpPromptLearner(instance_concepts_dict, instance_templates, clip_model, tokenizer, n_ctx)
+        
+        self.text_tower = clip_model.text if hasattr(clip_model, 'text') else clip_model
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+        
+        self.n_cls = len(bag_concepts_dict.keys())
+        self.coord_trans = nn.Sequential(nn.Linear(self.n_cls, 1))
+
+    def _encode_prompts(self, learner):
+        """Helper to process prompts through the text tower and generate prototypes."""
+        prompts, class_indices = learner()
+        x = prompts + self.text_tower.positional_embedding
+        x = x.permute(1, 0, 2)  
+        x = self.text_tower.transformer(x, attn_mask=self.text_tower.attn_mask)
+        x = x.permute(1, 0, 2)  
+        x = self.text_tower.ln_final(x)
+        
+        eos_indices = learner.attention_mask.sum(dim=-1) - 1 + learner.n_ctx
+        text_features = x[torch.arange(x.shape[0]), eos_indices]
+        
+        if hasattr(self.text_tower, 'text_projection') and self.text_tower.text_projection is not None:
+            text_features = text_features @ self.text_tower.text_projection
+            
+        # Latent ensemble: average the concepts per class to create stable prototypes
+        class_prototypes = []
+        for (start_idx, end_idx) in class_indices:
+            cls_feats = text_features[start_idx:end_idx]
+            class_prototypes.append(torch.mean(cls_feats, dim=0))
+            
+        return F.normalize(torch.stack(class_prototypes), p=2, dim=-1)
+
+    def forward(self, features):
+        bag_text_features = self._encode_prompts(self.bag_learner)
+        instance_text_features = self._encode_prompts(self.instance_learner)
+
+        features_norm = F.normalize(features, p=2, dim=-1)
+        
+        # 1. Instance-Level Attention (learnablePrompt strategy from TOP)
+        raw_sims = features_norm @ instance_text_features.t()
+        attn_scores = self.coord_trans(raw_sims)
+        w = torch.softmax(attn_scores / 0.33, dim=0) # 0.33 temp for stability
+        
+        # 2. Patch Pooling
+        slide_emb = torch.mm(w.t(), features)
+        slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
+        
+        # 3. Bag-Level Classification
+        clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
+        logits = (slide_emb_norm @ bag_text_features.t()) * clamped_scale
+        
+        return logits, slide_emb_norm, w        

@@ -50,28 +50,46 @@ os.environ.setdefault("HF_HOME", str(CACHE_DIR))
 if CACHE_DIR.exists() and any(CACHE_DIR.iterdir()):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
-
-TEMPLATES = [
-    "An H&E stained liver patch showing {}.", 
-    "Pathology slide revealing {}."
+    
+INSTANCE_TEMPLATES = [
+    "A high-magnification H&E stained liver tissue patch exhibiting {}.", 
+    "A detailed microscopic pathology view revealing {}."
 ]
 
-CONCEPTS = {
-    "Non-Drinking": [
-        "orderly cords of normal hepatocytes", 
-        "uniform hepatocytes with granular eosinophilic cytoplasm", 
-        "radiating hepatic sinusoids lined by endothelial cells", 
-        "intact portal tracts containing bile ducts and vessels", 
-        "normal central vein architecture"
+BAG_TEMPLATES = [
+    "A comprehensive whole slide image pathology diagnosis indicating {}."
+]
+
+INSTANCE_CONCEPTS = {
+    "Healthy Liver": [
+        "perfectly orderly cords of normal hepatocytes radiating from a pristine central vein", 
+        "uniform, healthy hepatocytes with granular eosinophilic cytoplasm and distinct nuclei without lipid droplets", 
+        "radiating hepatic sinusoids lined by intact endothelial cells lacking inflammatory infiltrates", 
+        "clean and intact portal tracts containing regular bile ducts, hepatic arteries, and portal veins", 
+        "normal central vein architecture with no perivenular fibrosis or collagen deposition"
     ],
-    "Drinking": [
-        "macrovesicular steatosis", 
-        "microvesicular lipid accumulation", 
-        "hepatocyte ballooning degeneration", 
-        "neutrophilic lobular inflammation", 
-        "perisinusoidal fibrosis"
+    "Alcoholic Liver Disease": [
+        "prominent macrovesicular steatosis where large lipid droplets completely displace hepatocyte nuclei", 
+        "extensive microvesicular lipid accumulation giving hepatocytes a foamy appearance", 
+        "classic hepatocyte ballooning degeneration with cellular swelling and Mallory-Denk body formation", 
+        "dense neutrophilic lobular inflammation forming microabscesses around degenerating hepatocytes", 
+        "distinct perisinusoidal and pericellular fibrosis creating a classic chicken-wire pattern of collagen deposition"
     ]
 }
+
+BAG_CONCEPTS = {
+    "Healthy Liver": [
+        "normal liver architecture with no signs of chronic alcohol consumption", 
+        "healthy hepatic tissue lacking steatosis, ballooning, or significant inflammation"
+    ],
+    "Alcoholic Liver Disease": [
+        "severe Alcoholic Liver Disease characterized by widespread steatosis and lobular inflammation", 
+        "chronic Alcoholic Liver Disease with established bridging fibrosis and hepatocyte ballooning"
+    ]
+}
+
+CONCEPTS = INSTANCE_CONCEPTS
+TEMPLATES = INSTANCE_TEMPLATES
 
 def set_seed(seed=42):
     """Ensures deterministic behavior across runs."""
@@ -227,7 +245,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
     pure_concept_dict = {}
     
     with torch.no_grad():
-        for cls in ["Non-Drinking", "Drinking"]:
+        for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
             for concept in CONCEPTS[cls]:
                 if concept not in pure_concept_dict:
                     inputs = tokenizer([concept], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
@@ -236,7 +254,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
                     pure_concept_dict[concept] = feat
                     
     with torch.no_grad():
-        for cls in ["Non-Drinking", "Drinking"]:
+        for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
             cls_feats = []
             for concept in CONCEPTS[cls]:
                 for t in TEMPLATES:
@@ -288,7 +306,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
             "features": torch.from_numpy(np.concatenate(slide_feats, axis=0)),
             "coords": coords, 
             "subject_id": subj_id,
-            "binary_category": "Non-Drinking" if subject_meta[subj_id]["category"] == "ND" else "Drinking"
+            "binary_category": "Healthy Liver" if subject_meta[subj_id]["category"] == "ND" else "Alcoholic Liver Disease"
         }, feature_out_path)
         
 # ==========================================
@@ -296,12 +314,12 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "coop"], default="abmil_adapter")
+    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "coop", "top"], default="abmil_adapter")
     parser.add_argument('--fusion', type=str, choices=["visual", "semantic"], default="semantic", help="Late fusion (visual) vs early fusion (semantic)")
     parser.add_argument('--n_ctx', type=int, default=16, help="Learnable context tokens (CoOp only).")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
-    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
     parser.add_argument('--reduction', type=int, default=8, help="Adapter bottleneck reduction factor.")
     parser.add_argument('--abmil_d', type=int, default=64, help="ABMIL projection dimension.")
     parser.add_argument('--shots', type=int, default=1, help="Samples per class for training.")
@@ -382,7 +400,7 @@ if __name__ == "__main__":
     
     if args.model == "abmil_adapter": model_str = f"{args.model}_{args.fusion}_r{args.reduction}_d{args.abmil_d}"
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}"
-    elif args.model == "coop": model_str = f"{args.model}_{args.fusion}_ctx{args.n_ctx}_d{args.abmil_d}"
+    elif args.model in ["coop", "top"]: model_str = f"{args.model}_{args.fusion}_ctx{args.n_ctx}_d{args.abmil_d}"
     else: model_str = f"{args.model}_{args.fusion}_d{args.abmil_d}"
         
     DYNAMIC_RESULTS_DIR = STANDALONE_DIR / f"{model_str}_{args.shots}shot_{args.iterations}iter"
@@ -394,8 +412,8 @@ if __name__ == "__main__":
     CURVES_DIR.mkdir(parents=True, exist_ok=True) 
 
     clip_model, tokenizer = None, None
-    if args.model == "coop":
-        logging.info("Loading text encoder for Prompt Learning (CoOp)...")
+    if args.model in ["coop", "top"]:
+        logging.info(f"Loading text encoder for Prompt Learning ({args.model.upper()})...")
         from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
         conch_checkpoint = PROJECT_ROOT / "models" / "CONCH" / "pytorch_model.bin"
         conch, _ = create_model_from_pretrained('conch_ViT-B-16', str(conch_checkpoint))
@@ -430,7 +448,8 @@ if __name__ == "__main__":
                 train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
                 text_prototypes=text_prototypes, device=device, args=args,
                 features_dir=FEATURES_DIR, clip_model=clip_model, tokenizer=tokenizer, 
-                concepts=CONCEPTS, templates=TEMPLATES
+                bag_concepts=BAG_CONCEPTS, instance_concepts=INSTANCE_CONCEPTS,
+                bag_templates=BAG_TEMPLATES, instance_templates=INSTANCE_TEMPLATES
             )
 
             # --- RESTORED: Probability Reporting ---
@@ -458,9 +477,10 @@ if __name__ == "__main__":
                 elif prob >= 0.8 or prob <= 0.2: conf_str = "High"
                 elif prob >= 0.6 or prob <= 0.4: conf_str = "Medium"
                 else: conf_str = "Low"
+
+                t_class = "ALD" if true_label == 1 else "Healthy"
+                p_class = "ALD" if pred_label == 1 else "Healthy"
                 
-                t_class = "Drinking" if true_label == 1 else "Non-Drinking"
-                p_class = "Drinking" if pred_label == 1 else "Non-Drinking"
                 correct = "Yes" if true_label == pred_label else "No"
                 
                 txt_lines.append(f"{subj:<15} | {t_class:<15} | {p_class:<15} | {correct:<8} | {prob:<15.4f} | {conf_str}")
@@ -529,6 +549,8 @@ if __name__ == "__main__":
             level=LEVEL,
             clip_model=clip_model, 
             tokenizer=tokenizer, 
-            concepts=CONCEPTS, 
-            templates=TEMPLATES
+            bag_concepts=BAG_CONCEPTS, 
+            instance_concepts=INSTANCE_CONCEPTS,
+            bag_templates=BAG_TEMPLATES, 
+            instance_templates=INSTANCE_TEMPLATES
         )

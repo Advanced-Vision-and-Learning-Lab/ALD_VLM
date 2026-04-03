@@ -22,10 +22,11 @@ from .mil_models import (
     ZSMILModel,
     TaskResModel,
     MaxPoolModel,
-    PromptLearningMILModel
+    PromptLearningMILModel,
+    TOPModel
 )
 
-def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokenizer=None, concepts=None, templates=None):
+def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokenizer=None, bag_concepts=None, instance_concepts=None, bag_templates=None, instance_templates=None):
     """
     Reconstructs the specified model architecture for xAI evaluation.
     """
@@ -47,6 +48,16 @@ def _initialize_xai_model(args, text_prototypes, device, clip_model=None, tokeni
             abmil_d=args.abmil_d,
             fusion=args.fusion,
         )
+    elif args.model == "top":
+        model = TOPModel(
+            clip_model=clip_model, 
+            tokenizer=tokenizer, 
+            bag_concepts_dict=bag_concepts, 
+            instance_concepts_dict=instance_concepts, 
+            bag_templates=bag_templates, 
+            instance_templates=instance_templates,
+            n_ctx=args.n_ctx
+        )    
     else:
         raise ValueError(f"Unknown model type: {args.model}")
         
@@ -78,7 +89,7 @@ def compute_integrated_gradients(model, features, device, steps=50):
     return importance_scores
 
 
-def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw_wsis_map, results_dir, patch_size, level=0, clip_model=None, tokenizer=None, concepts=None, templates=None):
+def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw_wsis_map, results_dir, patch_size, level=0, clip_model=None, tokenizer=None, bag_concepts=None, instance_concepts=None, bag_templates=None, instance_templates=None):
     """
     Executes the full xAI pipeline. Extracts highly weighted patches and verifies
     their semantic alignment with fine-tuned text concepts.
@@ -87,7 +98,7 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         return
 
     # Categorize models based on their fusion paradigm
-    early_fusion_models = ["zsmil", "taskres", "coop"] # SOTA paradigm
+    early_fusion_models = ["zsmil", "taskres", "coop", "top"] 
     late_fusion_models = ["abmil_adapter"]
     
     if args.model in early_fusion_models:
@@ -121,7 +132,18 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         
         logging.info(f"Running {xai_mode} xAI Analysis on WSI {wsi_id}... Saving to {out_dir.name}")
         
-        model = _initialize_xai_model(args, text_prototypes, device, clip_model, tokenizer, concepts, templates)
+        model = _initialize_xai_model(
+            args=args, 
+            text_prototypes=text_prototypes, 
+            device=device, 
+            clip_model=clip_model, 
+            tokenizer=tokenizer, 
+            bag_concepts=bag_concepts, 
+            instance_concepts=instance_concepts, 
+            bag_templates=bag_templates, 
+            instance_templates=instance_templates
+        )
+        
         model.load_state_dict({k: v.to(device) for k, v in xai_info["weights"].items()})
         model.eval()
 
@@ -234,30 +256,34 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         top_patch_feats = features[top_indices.copy()].detach().cpu().float()
         top_patch_feats = F.normalize(top_patch_feats, p=2, dim=-1).numpy()
         
-        # --- Handle CoOp Fine-Tuned Text Space ---
-        if args.model == "coop":
+        # --- Handle CoOp/TOP Fine-Tuned Text Space ---
+        if args.model in ["coop", "top"]:
+            learner = model.prompt_learner if args.model == "coop" else model.instance_learner
+            active_concepts = instance_concepts if args.model == "top" else bag_concepts # bag_concepts here represents the single CONCEPTS dict passed from demo if coop
+            active_templates = instance_templates if args.model == "top" else bag_templates
+            
             concept_phrases = []
-            for cls_name in model.prompt_learner.classes:
-                for concept in concepts[cls_name]:
-                    for t in templates:
+            for cls_name in learner.classes:
+                for concept in active_concepts[cls_name]:
+                    for t in active_templates:
                         concept_phrases.append(t.format(concept))
             
             with torch.no_grad(), torch.autocast(device_type=device.type):
-                prompts, _ = model.prompt_learner()
+                prompts, _ = learner()
                 x = prompts + model.text_tower.positional_embedding
                 x = x.permute(1, 0, 2)  
                 x = model.text_tower.transformer(x, attn_mask=model.text_tower.attn_mask)
                 x = x.permute(1, 0, 2)  
                 x = model.text_tower.ln_final(x)
                 
-                eos_indices = model.prompt_learner.attention_mask.sum(dim=-1) - 1 + model.prompt_learner.n_ctx
+                eos_indices = learner.attention_mask.sum(dim=-1) - 1 + learner.n_ctx
                 text_features = x[torch.arange(x.shape[0]), eos_indices]
                 
                 if hasattr(model.text_tower, 'text_projection') and model.text_tower.text_projection is not None:
                     text_features = text_features @ model.text_tower.text_projection
             
             concept_matrix = F.normalize(text_features, p=2, dim=-1).cpu().numpy()
-            report_header = "Top 15 Patches - Fine-Tuned CoOp Concept Alignment"
+            report_header = f"Top 15 Patches - Fine-Tuned {args.model.upper()} Concept Alignment"
             
         else:
             concept_matrix = np.stack(list(pure_concept_dict.values()))
@@ -287,7 +313,7 @@ def run_xai_analysis(xai_infos, args, text_prototypes, device, features_dir, raw
         slide_emb_norm = F.normalize(slide_emb_float, p=2, dim=-1).numpy().squeeze()
         
         sentence_scores = {}
-        if args.model == "coop":
+        if args.model in ["coop", "top"]:
             for idx, phrase in enumerate(concept_phrases):
                 if any(c in phrase for c in target_concepts):
                     sentence_scores[phrase] = float(np.dot(slide_emb_norm, concept_matrix[idx]))

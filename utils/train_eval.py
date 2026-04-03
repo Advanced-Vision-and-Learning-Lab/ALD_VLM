@@ -26,7 +26,8 @@ from .mil_models import (
     ZSMILModel, 
     TaskResModel, 
     MaxPoolModel, 
-    PromptLearningMILModel
+    PromptLearningMILModel,
+    TOPModel
 )
 
 class WSIPatchDataset(Dataset):
@@ -155,8 +156,12 @@ class DynamicWSIDataset(Dataset):
     def __init__(self, subject_ids: List[str], features_dir: Path):
         self.subject_ids = subject_ids
         self.features_dir = features_dir
-        self.label_map = {"Non-Drinking": 0, "Drinking": 1}
-
+        self.label_map = {
+                    "Non-Drinking": 0, 
+                    "Drinking": 1,
+                    "Healthy Liver": 0, 
+                    "Alcoholic Liver Disease": 1
+                }
     def __len__(self): 
         return len(self.subject_ids)
 
@@ -202,9 +207,9 @@ def evaluate(model, loader, device, criterion):
     avg_loss = run_loss / len(loader.dataset)
     bacc = sklearn.metrics.balanced_accuracy_score(targets, preds)
     return avg_loss, bacc, subject_preds, subject_probs
+       
     
-    
-def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, args, features_dir, clip_model=None, tokenizer=None, concepts=None, templates=None):
+def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, args, features_dir, clip_model=None, tokenizer=None, bag_concepts=None, instance_concepts=None, bag_templates=None, instance_templates=None):
     """
     Executes the training and evaluation loop for a single fold/iteration.
     """
@@ -229,6 +234,16 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
             n_ctx=args.n_ctx, 
             abmil_d=args.abmil_d,
             fusion=args.fusion,
+        ).to(device)
+    elif args.model == "top":
+        model = TOPModel(
+            clip_model=clip_model, 
+            tokenizer=tokenizer, 
+            bag_concepts_dict=bag_concepts, 
+            instance_concepts_dict=instance_concepts, 
+            bag_templates=bag_templates, 
+            instance_templates=instance_templates,
+            n_ctx=args.n_ctx
         ).to(device)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
