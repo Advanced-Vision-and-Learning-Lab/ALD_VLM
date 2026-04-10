@@ -8,6 +8,7 @@ import argparse
 import logging
 import os
 import re
+import sys
 import random
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
@@ -74,23 +75,22 @@ INSTANCE_CONCEPTS = {
     ]
 }
 
-BAG_TEMPLATES = [
-    "A comprehensive whole slide image pathology diagnosis indicating {}."
-]
-
-BAG_CONCEPTS = {
+BAG_PROMPTS = {
     "Healthy Liver": [
-        "normal liver architecture with preserved lobular structure",
-        "healthy hepatic tissue with intact portal and central vein relationships" 
+        "A comprehensive whole slide image pathology diagnosis indicating normal liver architecture with preserved lobular structure.",
+        "A comprehensive whole slide image pathology diagnosis indicating healthy hepatic tissue with intact portal and central vein relationships.",
+        "An H&E stained tissue section showing unremarkable hepatocytes arranged in regular cords.",
+        "Microscopic examination of the liver reveals standard lobular organization and clear sinusoids.",
+        "A routine H&E pathology slide displaying typical hepatic parenchyma and regular cellular morphology."
     ],
     "Alcoholic Liver Disease": [
-        "steatohepatitis with concurrent steatosis, inflammation, and cellular injury",
-        "chronic liver disease characterized by widespread steatosis and lobular inflammation"
+        "A comprehensive whole slide image pathology diagnosis indicating steatohepatitis with concurrent steatosis, inflammation, and cellular injury.",
+        "A comprehensive whole slide image pathology diagnosis indicating chronic liver disease characterized by widespread steatosis and lobular inflammation.",
+        "An H&E stained section demonstrating severe macrovesicular steatosis accompanied by hepatocyte ballooning.",
+        "Microscopic evaluation reveals characteristic alcoholic liver injury including Mallory-Denk bodies and neutrophilic infiltrates.",
+        "Pathology evaluation of the hepatic tissue highlights prominent lipid accumulation, lobular inflammation, and pericellular fibrosis."
     ]
 }
-
-CONCEPTS = INSTANCE_CONCEPTS
-TEMPLATES = INSTANCE_TEMPLATES
 
 def set_seed(seed=42):
     """Ensures deterministic behavior across runs."""
@@ -108,10 +108,6 @@ def parse_subject_id(filename):
 # TISSUE PROCESSING & PATCH EXTRACTION
 # ==========================================
 def generate_tissue_mask(slide, thumb_factor=32):
-    """
-    Generates a tissue mask using Global Otsu thresholding and contour filtering.
-    Isolates valid tissue while removing glass background and non-tissue artifacts.
-    """
     Wl, Hl = slide.level_dimensions[LEVEL]
     thumb = slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor))
     thumb_arr = np.array(thumb.convert("RGB"))
@@ -148,19 +144,13 @@ def generate_slide_preview(slide, slide_name, subject_id, thumb_factor=32):
         
     mask, thumb_arr, valid_contours = generate_tissue_mask(slide, thumb_factor)
     
-    # Save purely original slide (no green borders, no subplots)
     plt.imsave(original_path, thumb_arr)
     
-    # Save purely processed slide (pure white background)
     processed_thumb = thumb_arr.copy()
     processed_thumb[~mask] = [255, 255, 255] 
     plt.imsave(processed_path, processed_thumb)
-   
+    
 def _extract_patches_worker(slide_path):
-    """
-    Multiprocessing worker function for patch coordinate extraction.
-    Validates patches based on tissue content, brightness, and focus constraints.
-    """
     slide_name = Path(slide_path).name
     subject_id = parse_subject_id(slide_name)
     out_pt = PATCHES_DIR / f"{subject_id}_patches.pt"
@@ -190,20 +180,17 @@ def _extract_patches_worker(slide_path):
             tx = int(x0 // thumb_factor)            
             patch_mask = mask[ty:ty+p_size_thumb, tx:tx+p_size_thumb]
             
-            # Minimum 75% tissue coverage required
             if patch_mask.size == 0 or float(patch_mask.mean()) < 0.75:
                 continue 
                 
             patch_img = np.array(slide.read_region((x0, y0), LEVEL, (PATCH_SIZE, PATCH_SIZE)).convert("RGB"))
             gray_patch = cv2.cvtColor(patch_img, cv2.COLOR_RGB2GRAY)
             
-            # Brightness check to filter out empty slide areas
             white_pixels = np.sum(gray_patch > 220) 
             total_pixels = PATCH_SIZE * PATCH_SIZE
             if (white_pixels / total_pixels) > 0.25: 
                 continue
                 
-            # Localized blur detection via variance of Laplacian
             half = PATCH_SIZE // 2
             focus_scores = [
                 cv2.Laplacian(gray_patch[:half, :half], cv2.CV_64F).var(),
@@ -230,9 +217,6 @@ def _extract_patches_worker(slide_path):
 # FEATURE EXTRACTION
 # ==========================================
 def run_feature_extraction(device, valid_subjects, subject_meta):
-    """
-    Encodes text concepts and visual WSI patches using the CONCH vision-language model.
-    """
     logging.info("Loading CONCH model for feature extraction...")
     from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
     conch_checkpoint = PROJECT_ROOT / "models" / "CONCH" / "pytorch_model.bin"
@@ -241,36 +225,50 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
     model.eval()
     tokenizer = get_tokenizer()
                 
-    text_features_list = []
+    # Bag-Level Extraction
+    bag_feats_list = []
+    text_to_feature_dict = {} 
+    
+    with torch.no_grad():
+        for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
+            cls_feats = []
+            for prompt in BAG_PROMPTS[cls]:
+                inputs = tokenizer([prompt], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
+                outputs = model.encode_text(inputs["input_ids"].to(device))
+                feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
+                cls_feats.append(feat)
+                text_to_feature_dict[prompt] = feat 
+                
+            cls_prototype = np.mean(cls_feats, axis=0)
+            bag_feats_list.append(cls_prototype / np.linalg.norm(cls_prototype))
+    
+    np.save(FEATURES_DIR / "bag_embeddings.npy", np.stack(bag_feats_list))
+    torch.save(text_to_feature_dict, FEATURES_DIR / "training_text_embeddings.pt")
+
+    # Instance-Level Extraction
+    instance_feats_list = []
     concept_dict = {}
     pure_concept_dict = {}
     
     with torch.no_grad():
         for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
-            for concept in CONCEPTS[cls]:
-                if concept not in pure_concept_dict:
-                    inputs = tokenizer([concept], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
-                    outputs = model.encode_text(inputs["input_ids"].to(device))
-                    feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
-                    pure_concept_dict[concept] = feat
-                    
-    with torch.no_grad():
-        for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
-            cls_feats = []
-            for concept in CONCEPTS[cls]:
-                for t in TEMPLATES:
+            for concept in INSTANCE_CONCEPTS[cls]:
+                # Pure concept
+                inputs = tokenizer([concept], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
+                outputs = model.encode_text(inputs["input_ids"].to(device))
+                feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
+                pure_concept_dict[concept] = feat
+                
+                # Templated concepts
+                for t in INSTANCE_TEMPLATES:
                     prompt = t.format(concept)
                     inputs = tokenizer([prompt], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
                     outputs = model.encode_text(inputs["input_ids"].to(device))
                     feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
-                    
                     concept_dict[prompt] = feat
-                    cls_feats.append(feat)
+                    instance_feats_list.append(feat)
                     
-            cls_prototype = np.mean(cls_feats, axis=0)
-            text_features_list.append(cls_prototype / np.linalg.norm(cls_prototype))
-            
-    np.save(FEATURES_DIR / "text_prototypes.npy", np.stack(text_features_list))
+    np.save(FEATURES_DIR / "instance_embeddings.npy", np.stack(instance_feats_list))
     torch.save(concept_dict, FEATURES_DIR / "concept_embeddings.pt")
     torch.save(pure_concept_dict, FEATURES_DIR / "pure_concept_embeddings.pt")
     
@@ -315,10 +313,12 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "coop", "top"], default="abmil_adapter")
-    parser.add_argument('--fusion', type=str, choices=["visual", "semantic"], default="semantic", help="Late fusion (visual) vs early fusion (semantic)")
-    parser.add_argument('--n_ctx', type=int, default=16, help="Learnable context tokens (CoOp only).")
-    parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
+    parser.add_argument('--model', type=str, choices=[
+        "abmil_adapter", "zsmil", "taskres", "max_pool", "pre_agg_semantic"
+    ], default="abmil_adapter")
+    parser.add_argument('--max_pool_head', type=str, choices=[
+        "none", "adapter", "taskres"
+    ], default="none")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
     parser.add_argument('--reduction', type=int, default=8, help="Adapter bottleneck reduction factor.")
@@ -333,7 +333,6 @@ if __name__ == "__main__":
     args.accum_steps = args.shots * 2
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Subject Metadata Parsing
     RAW_SUBJECTS = """
     10095 Rhesus 7a M ND
     10093 Rhesus 7a M ND
@@ -399,39 +398,34 @@ if __name__ == "__main__":
     SHARED_SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_JSON_PATH = SHARED_SPLITS_DIR / f"dataset_splits_{args.shots}shot_{args.iterations}iter_{int(args.dataset_pct*100)}pct.json"
     
-    if args.model == "abmil_adapter": model_str = f"{args.model}_{args.fusion}_r{args.reduction}_d{args.abmil_d}"
+    if args.model in ["abmil_adapter", "pre_agg_semantic"]: model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}"
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}"
-    elif args.model in ["coop", "top"]: model_str = f"{args.model}_{args.fusion}_ctx{args.n_ctx}_d{args.abmil_d}"
-    else: model_str = f"{args.model}_{args.fusion}_d{args.abmil_d}"
-        
+    else: model_str = f"{args.model}_d{args.abmil_d}"
+
     DYNAMIC_RESULTS_DIR = STANDALONE_DIR / f"{model_str}_{args.shots}shot_{args.iterations}iter"
+
+    if (DYNAMIC_RESULTS_DIR / "summary_metrics.txt").exists():
+        logging.info(f"Experiment {DYNAMIC_RESULTS_DIR.name} already exists and is complete. Skipping.")
+        sys.exit(0)
+    
     PROBS_DIR = DYNAMIC_RESULTS_DIR / "test_probabilities" 
-    CURVES_DIR = DYNAMIC_RESULTS_DIR / "training_curves" # Added this
+    CURVES_DIR = DYNAMIC_RESULTS_DIR / "training_curves" 
     
     DYNAMIC_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     PROBS_DIR.mkdir(parents=True, exist_ok=True)
     CURVES_DIR.mkdir(parents=True, exist_ok=True) 
 
-    clip_model, tokenizer = None, None
-    if args.model in ["coop", "top"]:
-        logging.info(f"Loading text encoder for Prompt Learning ({args.model.upper()})...")
-        from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
-        conch_checkpoint = PROJECT_ROOT / "models" / "CONCH" / "pytorch_model.bin"
-        conch, _ = create_model_from_pretrained('conch_ViT-B-16', str(conch_checkpoint))
-        tokenizer = get_tokenizer()
-        clip_model = conch.to(device)
-        clip_model.eval()
-        for param in clip_model.parameters():
-            param.requires_grad = False
-    
     logging.info("Starting Processing Pipeline...")
     with ProcessPoolExecutor(max_workers=4) as ex:
         list(tqdm(ex.map(_extract_patches_worker, list(raw_wsis.values())), total=len(raw_wsis)))
         
     run_feature_extraction(device, valid_subjects, SUBJECT_META)
-    text_prototypes = np.load(FEATURES_DIR / "text_prototypes.npy")
+    bag_embeddings = np.load(FEATURES_DIR / "bag_embeddings.npy")
+    instance_embeddings = np.load(FEATURES_DIR / "instance_embeddings.npy")
     
-    val_baccs, test_baccs, test_aucs, test_f1s, combo_report_logs, all_epochs, xai_infos = [], [], [], [], [], [], []
+    flat_val_baccs, flat_test_baccs, flat_test_aucs, flat_test_f1s, flat_epochs = [], [], [], [], []
+    combo_report_logs, xai_infos = [], []
+    
     dataset_splits = load_or_create_splits(SPLITS_JSON_PATH, args.shots, ND_POOL, D_POOL, SUBJECT_META, args.iterations)
     
     logging.info(f"Initiating Few-Shot Evaluation: {args.model.upper()} | {args.shots} Shots")
@@ -445,23 +439,20 @@ if __name__ == "__main__":
         for n_seed in range(args.seeds):
             set_seed(n_seed)
 
-
             val_bacc, test_bacc, test_auc, test_f1, stopped_epoch, eval_probs, eval_preds, eval_ids, b_weights, history = train_and_eval_fold(
                 train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
-                text_prototypes=text_prototypes, device=device, args=args,
-                features_dir=FEATURES_DIR, clip_model=clip_model, tokenizer=tokenizer, 
-                bag_concepts=BAG_CONCEPTS, instance_concepts=INSTANCE_CONCEPTS,
-                bag_templates=BAG_TEMPLATES, instance_templates=INSTANCE_TEMPLATES
+                bag_embeddings=bag_embeddings, instance_embeddings=instance_embeddings, device=device, args=args,
+                features_dir=FEATURES_DIR
             )
 
-            # --- RESTORED: Probability Reporting ---
+            # --- Probability Reporting ---
             txt_lines = [
                 "============================================================",
                 "               EVALUATION PROBABILITY REPORT",
                 "============================================================",
                 f"Iteration : {fold_idx}",
                 f"Seed      : {n_seed}",
-                f"Model     : {args.model.upper()} ({args.fusion} fusion)",
+                f"Model     : {args.model.upper()}",
                 f"Shots     : {args.shots}",
                 "------------------------------------------------------------",
                 f"Train Subjects: {', '.join(train_ids)}",
@@ -482,7 +473,6 @@ if __name__ == "__main__":
 
                 t_class = "ALD" if true_label == 1 else "Healthy"
                 p_class = "ALD" if pred_label == 1 else "Healthy"
-                
                 correct = "Yes" if true_label == pred_label else "No"
                 
                 txt_lines.append(f"{subj:<15} | {t_class:<15} | {p_class:<15} | {correct:<8} | {prob:<15.4f} | {conf_str}")
@@ -497,11 +487,15 @@ if __name__ == "__main__":
             fold_val_bacc.append(val_bacc)
             fold_test_bacc.append(test_bacc)
             fold_epochs.append(stopped_epoch)
-            test_aucs.append(test_auc) # New
-            test_f1s.append(test_f1)   # New
             
-            # Queue confident predictions for interpretation analysis
-            if fold_idx == 1 and n_seed == 0:
+            flat_val_baccs.append(val_bacc)
+            flat_test_baccs.append(test_bacc)
+            flat_test_aucs.append(test_auc)
+            flat_test_f1s.append(test_f1)
+            flat_epochs.append(stopped_epoch)
+            
+            # Now saving xAI info for both Iteration 1 and Iteration 2
+            if fold_idx in [1, 2] and n_seed == 0: 
                 for subj_id in eval_ids:
                     if subj_id in D_POOL and eval_preds.get(subj_id) == 1:
                         xai_infos.append({
@@ -515,10 +509,6 @@ if __name__ == "__main__":
         avg_test_bacc, std_test_bacc = np.mean(fold_test_bacc), np.std(fold_test_bacc)
         avg_epochs, std_epochs = np.mean(fold_epochs), np.std(fold_epochs)
         
-        val_baccs.append(avg_val_bacc)
-        test_baccs.append(avg_test_bacc)
-        all_epochs.append(avg_epochs)
-        
         log_str = (f"Iter {fold_idx:02d}/{args.iterations} | Train:[{','.join(train_ids)}] "
                    f"Val:[{','.join(val_ids)}] Test:[{len(test_ids)} subjects] | "
                    f"Epochs: {avg_epochs:.1f}±{std_epochs:.1f} | "
@@ -528,33 +518,28 @@ if __name__ == "__main__":
         combo_report_logs.append(f"Iter {fold_idx:02d}: Train:[{','.join(train_ids)}] | Test Subjects: [{len(test_ids)}] -> Test BACC: {avg_test_bacc:.4f} ± {std_test_bacc:.4f}")
             
     summary = (
-        f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - {args.fusion} fusion - {args.shots} Shot)\n{'='*80}\n"
-        f"Average Epochs: {np.mean(all_epochs):.1f} ± {np.std(all_epochs):.1f}\n{'='*80}\n"
+        f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - Visual Fusion - {args.shots} Shot)\n{'='*80}\n"
+        f"Average Epochs: {np.mean(flat_epochs):.1f} ± {np.std(flat_epochs):.1f}\n{'='*80}\n"
         f"INDIVIDUAL COMBO DETAILS:\n" + "\n".join(combo_report_logs) + f"\n{'='*80}\n"
-        f"OVERALL METRICS (Mean of {args.iterations} Iterations):\n"
-        f"Validation BACC: {np.mean(val_baccs):.4f} ± {np.std(val_baccs):.4f}\n"
-        f"Test BACC:       {np.mean(test_baccs):.4f} ± {np.std(test_baccs):.4f}\n"
-        f"Test AUC-ROC:    {np.mean(test_aucs):.4f} ± {np.std(test_aucs):.4f}\n"
-        f"Test F1-Score:   {np.mean(test_f1s):.4f} ± {np.std(test_f1s):.4f}\n{'='*80}"
+        f"OVERALL METRICS (Across {args.iterations * args.seeds} Total Runs):\n"
+        f"Validation BACC: {np.mean(flat_val_baccs):.4f} ± {np.std(flat_val_baccs):.4f}\n"
+        f"Test BACC:       {np.mean(flat_test_baccs):.4f} ± {np.std(flat_test_baccs):.4f}\n"
+        f"Test AUC-ROC:    {np.mean(flat_test_aucs):.4f} ± {np.std(flat_test_aucs):.4f}\n"
+        f"Test F1-Score:   {np.mean(flat_test_f1s):.4f} ± {np.std(flat_test_f1s):.4f}\n{'='*80}"
     )
     print(summary)
     with open(DYNAMIC_RESULTS_DIR / f"summary_metrics.txt", "w") as f: f.write(summary)
-    # Run downstream explainability
+    
     if xai_infos:
         run_xai_analysis(
             xai_infos=xai_infos, 
             args=args, 
-            text_prototypes=text_prototypes, 
+            bag_embeddings=bag_embeddings,
+            instance_embeddings=instance_embeddings,
             device=device, 
             features_dir=FEATURES_DIR, 
             raw_wsis_map=raw_wsis, 
             results_dir=DYNAMIC_RESULTS_DIR, 
             patch_size=PATCH_SIZE, 
-            level=LEVEL,
-            clip_model=clip_model, 
-            tokenizer=tokenizer, 
-            bag_concepts=BAG_CONCEPTS, 
-            instance_concepts=INSTANCE_CONCEPTS,
-            bag_templates=BAG_TEMPLATES, 
-            instance_templates=INSTANCE_TEMPLATES
+            level=LEVEL
         )

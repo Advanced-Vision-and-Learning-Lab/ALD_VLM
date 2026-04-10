@@ -11,7 +11,6 @@ import torch.nn.functional as F
 class ABMIL(nn.Module):
     """
     Standard Attention-Based Multiple Instance Learning (ABMIL) aggregation.
-    Used for 'visual' fusion mode.
     """
     def __init__(self, L=512, D=64, K=1):
         super().__init__()
@@ -35,20 +34,17 @@ class ABMIL(nn.Module):
         A_U = self.attention_U(features)
         raw_scores = self.attention_weights(A_V * A_U)
         
-        # Fixed temperature for attention stability
         w = torch.softmax(raw_scores / 0.33, dim=0)
         return torch.mm(w.t(), features), w
-        
+
 class MaxPoolModel(nn.Module):
-    """
-    Baseline MIL Model using standard max-pooling for feature aggregation.
-    """
     def __init__(self, text_embeddings, head_type="none", reduction=4, alpha=0.25):
         super().__init__()
         self.c_in = 512
         self.head_type = head_type
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+        
         if self.head_type == "adapter":
             self.reduction = reduction
             self.ratio = 0.2
@@ -89,86 +85,16 @@ class MaxPoolModel(nn.Module):
         
         return logits, embedding_norm, w
 
-
-class CoOpPromptLearner(nn.Module):
-    """
-    Learnable Prompt Context for Vision-Language Models (Context Optimization).
-    Generates dynamic text embeddings by appending learnable tokens to templates.
-    """
-    def __init__(self, concepts_dict, templates, clip_model, tokenizer, n_ctx=16):
-        super().__init__()
-        self.classes = list(concepts_dict.keys())
-        self.n_cls = len(self.classes)
-        self.n_ctx = n_ctx
-        
-        self.text_tower = clip_model.text if hasattr(clip_model, 'text') else clip_model
-        
-        if self.text_tower.positional_embedding.dim() == 2:
-            self.max_seq_len = self.text_tower.positional_embedding.shape[0]
-        else:
-            self.max_seq_len = self.text_tower.positional_embedding.shape[1]
-        
-        if hasattr(self.text_tower, 'text_projection') and self.text_tower.text_projection is not None:
-            ctx_dim = self.text_tower.text_projection.shape[0]
-        else:
-            ctx_dim = self.text_tower.token_embedding.weight.shape[1]
-            
-        self.ctx = nn.Parameter(torch.empty(n_ctx, ctx_dim))
-        nn.init.normal_(self.ctx, std=0.02)
-        
-        all_prompts = []
-        self.class_indices = []
-        
-        current_idx = 0
-        for cls_name in self.classes:
-            concepts = concepts_dict[cls_name]
-            start_idx = current_idx
-            for concept in concepts:
-                for t in templates:
-                    all_prompts.append(t.format(concept))
-                    current_idx += 1
-            self.class_indices.append((start_idx, current_idx))
-            
-        tokens_dict = tokenizer(
-            all_prompts, 
-            padding="max_length", 
-            max_length=self.max_seq_len, 
-            truncation=True, 
-            return_tensors="pt"
-        )
-        
-        self.register_buffer("tokenized_prompts", tokens_dict["input_ids"])
-        self.register_buffer("attention_mask", tokens_dict["attention_mask"])
-        
-        with torch.no_grad():
-            embedding = self.text_tower.token_embedding(
-                self.tokenized_prompts.to(self.text_tower.token_embedding.weight.device)
-            )
-            
-        self.register_buffer("token_prefix", embedding[:, :1, :])  
-        self.register_buffer("token_suffix", embedding[:, 1 : self.max_seq_len - n_ctx, :])  
-
-    def forward(self):
-        total_prompts = self.token_prefix.shape[0]
-        ctx_expanded = self.ctx.unsqueeze(0).expand(total_prompts, -1, -1)
-        prompts = torch.cat([self.token_prefix, ctx_expanded, self.token_suffix], dim=1)
-        return prompts, self.class_indices
-
-
 class ABMILAdapterModel(nn.Module):
-    def __init__(self, text_embeddings, reduction=4, abmil_d=64, fusion="visual"):
+    def __init__(self, text_embeddings, reduction=4, abmil_d=64):
         super().__init__()
         self.c_in = 512
         self.reduction = reduction
         self.ratio = 0.2
-        self.fusion = fusion
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         
-        if self.fusion == "visual":
-            self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
-        else:
-            self.coord_trans = nn.Sequential(nn.Linear(text_embeddings.shape[0], 1))
+        self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
             
         self.adapter = nn.Sequential(
             nn.Linear(self.c_in, self.c_in // self.reduction, bias=False),
@@ -182,14 +108,7 @@ class ABMILAdapterModel(nn.Module):
     def forward(self, features):
         prototype_norm = F.normalize(self.text_embeddings, p=2, dim=-1)
         
-        if self.fusion == "visual":
-            embedding, w = self.aggregator(features)
-        else:
-            features_norm = F.normalize(features, p=2, dim=-1)
-            raw_sims = features_norm @ prototype_norm.t()
-            attn_scores = self.coord_trans(raw_sims)
-            w = torch.softmax(attn_scores / 0.33, dim=0)
-            embedding = torch.mm(w.t(), features)
+        embedding, w = self.aggregator(features)
             
         res = self.adapter(embedding)
         adapted_emb = self.ratio * res + (1 - self.ratio) * embedding
@@ -200,29 +119,17 @@ class ABMILAdapterModel(nn.Module):
         
         return logits, adapted_emb, w
 
-
 class ZSMILModel(nn.Module):
-    def __init__(self, text_embeddings, abmil_d=64, fusion="semantic"):
+    def __init__(self, text_embeddings, abmil_d=64):
         super().__init__()
-        self.fusion = fusion
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
-        if self.fusion == "visual":
-            self.aggregator = ABMIL(L=512, D=abmil_d)
-        else:
-            self.coord_trans = nn.Sequential(nn.Linear(text_embeddings.shape[0], 1))
+        self.aggregator = ABMIL(L=512, D=abmil_d)
 
     def forward(self, features):
         prototype_norm = F.normalize(self.text_embeddings, p=2, dim=-1)
         
-        if self.fusion == "visual":
-            embedding, w = self.aggregator(features)
-        else:
-            features_norm = F.normalize(features, p=2, dim=-1)
-            raw_sims = features_norm @ prototype_norm.t()
-            attn_scores = self.coord_trans(raw_sims)
-            w = torch.softmax(attn_scores / 0.33, dim=0)
-            embedding = torch.mm(w.t(), features)
+        embedding, w = self.aggregator(features)
             
         embedding_norm = F.normalize(embedding, p=2, dim=-1)
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
@@ -230,33 +137,21 @@ class ZSMILModel(nn.Module):
         
         return logits, embedding_norm, w
 
-
 class TaskResModel(nn.Module):
-    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64, fusion="semantic"):
+    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64):
         super().__init__()
         self.alpha = alpha
-        self.fusion = fusion
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.task_res = nn.Parameter(torch.zeros_like(self.text_embeddings))
         
-        if self.fusion == "visual":
-            self.aggregator = ABMIL(L=512, D=abmil_d)
-        else:
-            self.coord_trans = nn.Sequential(nn.Linear(text_embeddings.shape[0], 1))
+        self.aggregator = ABMIL(L=512, D=abmil_d)
 
     def forward(self, features):
         adapted_prototype = self.text_embeddings + self.alpha * self.task_res
         prototype_norm = F.normalize(adapted_prototype, p=2, dim=-1)
         
-        if self.fusion == "visual":
-            embedding, w = self.aggregator(features)
-        else:
-            features_norm = F.normalize(features, p=2, dim=-1)
-            raw_sims = features_norm @ prototype_norm.t()
-            attn_scores = self.coord_trans(raw_sims)
-            w = torch.softmax(attn_scores / 0.33, dim=0)
-            embedding = torch.mm(w.t(), features)
+        embedding, w = self.aggregator(features)
             
         embedding_norm = F.normalize(embedding, p=2, dim=-1)
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
@@ -264,139 +159,47 @@ class TaskResModel(nn.Module):
         
         return logits, embedding_norm, w
 
-
-class PromptLearningMILModel(nn.Module):
-    def __init__(self, clip_model, tokenizer, concepts_dict, templates, n_ctx=16, abmil_d=64, ensemble_mode="latent", fusion="semantic"):
+class PreAggSemanticModel(nn.Module):
+    """
+    Pre-Aggregation Semantic Adaptation Model.
+    Shifts and L2-normalizes every individual tissue patch into the semantic space 
+    BEFORE passing them into the ABMIL gated attention mechanism.
+    """
+    def __init__(self, text_embeddings, reduction=8, abmil_d=64):
         super().__init__()
-        self.fusion = fusion
-        self.prompt_learner = CoOpPromptLearner(concepts_dict, templates, clip_model, tokenizer, n_ctx)
-        self.text_tower = clip_model.text if hasattr(clip_model, 'text') else clip_model
-        self.ensemble_mode = ensemble_mode 
+        self.c_in = 512
+        self.reduction = reduction
+        self.ratio = 0.2
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+        self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         
-        if self.fusion == "visual":
-            self.aggregator = ABMIL(L=512, D=abmil_d)
-        else:
-            self.n_cls = len(concepts_dict.keys())
-            self.coord_trans = nn.Sequential(nn.Linear(self.n_cls, 1))
+        # Patch-Level translation (bridging modality gap microscopically)
+        self.patch_translator = nn.Sequential(
+            nn.Linear(self.c_in, self.c_in // self.reduction, bias=False),
+            nn.LayerNorm(self.c_in // self.reduction),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.25),
+            nn.Linear(self.c_in // self.reduction, self.c_in, bias=False),
+        )
+        nn.init.zeros_(self.patch_translator[4].weight)
+        
+        # Standard ABMIL that now evaluates the semantically translated patches
+        self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
 
     def forward(self, features):
-        prompts, class_indices = self.prompt_learner()
-        x = prompts + self.text_tower.positional_embedding
-        x = x.permute(1, 0, 2)  
-        x = self.text_tower.transformer(x, attn_mask=self.text_tower.attn_mask)
-        x = x.permute(1, 0, 2)  
-        x = self.text_tower.ln_final(x)
+        prototype_norm = F.normalize(self.text_embeddings, p=2, dim=-1)
         
-        eos_indices = self.prompt_learner.attention_mask.sum(dim=-1) - 1 + self.prompt_learner.n_ctx
-        text_features = x[torch.arange(x.shape[0]), eos_indices]
+        # 1. Translate and explicitly L2-normalize every single patch
+        res = self.patch_translator(features)
+        translated_patches = self.ratio * res + (1 - self.ratio) * features
+        translated_patches_norm = F.normalize(translated_patches, p=2, dim=-1)
         
-        if hasattr(self.text_tower, 'text_projection') and self.text_tower.text_projection is not None:
-            text_features = text_features @ self.text_tower.text_projection
+        # 2. Score and aggregate the adapted patches
+        embedding, w = self.aggregator(translated_patches_norm)
             
-        if self.ensemble_mode == "latent":
-            class_prototypes = []
-            for (start_idx, end_idx) in class_indices:
-                cls_feats = text_features[start_idx:end_idx]
-                class_prototypes.append(torch.mean(cls_feats, dim=0))
-            text_features_norm = F.normalize(torch.stack(class_prototypes), p=2, dim=-1)
-        else:
-            text_features_norm = F.normalize(text_features, p=2, dim=-1) 
-        
-        if self.fusion == "visual":
-            slide_emb, w = self.aggregator(features)
-        else:
-            features_norm = F.normalize(features, p=2, dim=-1) 
-            raw_sims = features_norm @ text_features_norm.t() 
-            
-            if self.ensemble_mode != "latent":
-                class_sims = []
-                for (start_idx, end_idx) in class_indices:
-                    cls_score = torch.mean(raw_sims[:, start_idx:end_idx], dim=1, keepdim=True)
-                    class_sims.append(cls_score)
-                patch_class_sims = torch.cat(class_sims, dim=1) 
-            else:
-                patch_class_sims = raw_sims 
-
-            attn_scores = self.coord_trans(patch_class_sims) 
-            w = torch.softmax(attn_scores / 0.33, dim=0)
-            slide_emb = torch.mm(w.t(), features) 
-            
-        slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1) 
-        
-        if self.ensemble_mode == "latent":
-            logits = slide_emb_norm @ text_features_norm.t() 
-        else:
-            raw_slide_sims = slide_emb_norm @ text_features_norm.t()
-            class_logits = []
-            for (start_idx, end_idx) in class_indices:
-                cls_score = torch.mean(raw_slide_sims[:, start_idx:end_idx], dim=1, keepdim=True)
-                class_logits.append(cls_score)
-            logits = torch.cat(class_logits, dim=1) 
-        
+        # 3. Final classification computation
+        embedding_norm = F.normalize(embedding, p=2, dim=-1)
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = logits * clamped_scale
+        logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
         
-        return logits, slide_emb_norm, w
-        
-class TOPModel(nn.Module):
-    """
-    TOP Multiple Instance Learning Model.
-    Utilizes dual prompt learners: one for instance-level attention (patch pooling) 
-    and one for bag-level classification (WSI diagnosis).
-    """
-    def __init__(self, clip_model, tokenizer, bag_concepts_dict, instance_concepts_dict, bag_templates, instance_templates, n_ctx=16):
-        super().__init__()
-        # Dual Prompt Learners
-        self.bag_learner = CoOpPromptLearner(bag_concepts_dict, bag_templates, clip_model, tokenizer, n_ctx)
-        self.instance_learner = CoOpPromptLearner(instance_concepts_dict, instance_templates, clip_model, tokenizer, n_ctx)
-        
-        self.text_tower = clip_model.text if hasattr(clip_model, 'text') else clip_model
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
-        
-        self.n_cls = len(bag_concepts_dict.keys())
-        self.coord_trans = nn.Sequential(nn.Linear(self.n_cls, 1))
-
-    def _encode_prompts(self, learner):
-        """Helper to process prompts through the text tower and generate prototypes."""
-        prompts, class_indices = learner()
-        x = prompts + self.text_tower.positional_embedding
-        x = x.permute(1, 0, 2)  
-        x = self.text_tower.transformer(x, attn_mask=self.text_tower.attn_mask)
-        x = x.permute(1, 0, 2)  
-        x = self.text_tower.ln_final(x)
-        
-        eos_indices = learner.attention_mask.sum(dim=-1) - 1 + learner.n_ctx
-        text_features = x[torch.arange(x.shape[0]), eos_indices]
-        
-        if hasattr(self.text_tower, 'text_projection') and self.text_tower.text_projection is not None:
-            text_features = text_features @ self.text_tower.text_projection
-            
-        # Latent ensemble: average the concepts per class to create stable prototypes
-        class_prototypes = []
-        for (start_idx, end_idx) in class_indices:
-            cls_feats = text_features[start_idx:end_idx]
-            class_prototypes.append(torch.mean(cls_feats, dim=0))
-            
-        return F.normalize(torch.stack(class_prototypes), p=2, dim=-1)
-
-    def forward(self, features):
-        bag_text_features = self._encode_prompts(self.bag_learner)
-        instance_text_features = self._encode_prompts(self.instance_learner)
-
-        features_norm = F.normalize(features, p=2, dim=-1)
-        
-        # 1. Instance-Level Attention (learnablePrompt strategy from TOP)
-        raw_sims = features_norm @ instance_text_features.t()
-        attn_scores = self.coord_trans(raw_sims)
-        w = torch.softmax(attn_scores / 0.33, dim=0) # 0.33 temp for stability
-        
-        # 2. Patch Pooling
-        slide_emb = torch.mm(w.t(), features)
-        slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
-        
-        # 3. Bag-Level Classification
-        clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = (slide_emb_norm @ bag_text_features.t()) * clamped_scale
-        
-        return logits, slide_emb_norm, w        
+        return logits, embedding_norm, w

@@ -26,8 +26,7 @@ from .mil_models import (
     ZSMILModel, 
     TaskResModel, 
     MaxPoolModel, 
-    PromptLearningMILModel,
-    TOPModel
+    PreAggSemanticModel
 )
 
 class WSIPatchDataset(Dataset):
@@ -66,11 +65,7 @@ class WSIPatchDataset(Dataset):
         pixel_values = (batch_ts - mean) / std
         return pixel_values
 
-
 def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, iterations=5):
-    """
-    Loads existing dataset splits or creates new ones using a stratified.
-    """
     if os.path.exists(json_path):
         logging.info(f"Loading existing dataset splits from {json_path}")
         with open(json_path, 'r') as f:
@@ -148,11 +143,7 @@ def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, itera
         
     return splits
 
-
 class DynamicWSIDataset(Dataset):
-    """
-    Dataset for dynamically loading pre-extracted WSI features.
-    """
     def __init__(self, subject_ids: List[str], features_dir: Path):
         self.subject_ids = subject_ids
         self.features_dir = features_dir
@@ -188,7 +179,8 @@ def evaluate(model, loader, device, criterion):
         for feats, label, subj_ids in loader:
             label = label.to(device)
             with torch.autocast(device_type=device.type):
-                logits, _, _ = model(feats.to(device).squeeze(0))
+                outputs = model(feats.to(device).squeeze(0))
+                logits = outputs[0]
                 loss = criterion(logits, label)
             run_loss += loss.item()
             
@@ -198,7 +190,7 @@ def evaluate(model, loader, device, criterion):
             pred = 1 if prob_drinking >= 0.5 else 0
             preds.append(pred)
             targets.append(label.item())
-            prob_list.append(prob_drinking) # Captured for AUC
+            prob_list.append(prob_drinking) 
             
             subj_id = subj_ids[0]
             subject_preds[subj_id] = pred
@@ -214,9 +206,8 @@ def evaluate(model, loader, device, criterion):
         auc = 0.5000 
         
     return avg_loss, bacc, auc, f1, subject_preds, subject_probs
-       
-    
-def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, args, features_dir, clip_model=None, tokenizer=None, bag_concepts=None, instance_concepts=None, bag_templates=None, instance_templates=None):
+        
+def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_embeddings, device, args, features_dir):
     """
     Executes the training and evaluation loop for a single fold/iteration.
     """
@@ -225,33 +216,15 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
     
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=text_prototypes, reduction=args.reduction, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
+        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
+    elif args.model == "pre_agg_semantic":
+        model = PreAggSemanticModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
     elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=text_prototypes, abmil_d=args.abmil_d).to(device)
+        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d).to(device)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=text_prototypes, alpha=0.25, abmil_d=args.abmil_d, fusion=args.fusion).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d).to(device)
     elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=text_prototypes, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25).to(device)
-    elif args.model == "coop":
-        model = PromptLearningMILModel(
-            clip_model=clip_model, 
-            tokenizer=tokenizer, 
-            concepts_dict=instance_concepts,  
-            templates=instance_templates,    
-            n_ctx=args.n_ctx, 
-            abmil_d=args.abmil_d,
-            fusion=args.fusion,
-        ).to(device)
-    elif args.model == "top":
-        model = TOPModel(
-            clip_model=clip_model, 
-            tokenizer=tokenizer, 
-            bag_concepts_dict=bag_concepts, 
-            instance_concepts_dict=instance_concepts, 
-            bag_templates=bag_templates, 
-            instance_templates=instance_templates,
-            n_ctx=args.n_ctx
-        ).to(device)
+        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25).to(device)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     
@@ -260,8 +233,6 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
     cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
     
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    criterion = torch.nn.CrossEntropyLoss(reduction="sum")
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     criterion = torch.nn.CrossEntropyLoss(reduction="sum")
     
@@ -287,13 +258,15 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, text_prototypes, device, a
         
             if scaler:
                 with torch.autocast(device_type=device.type):
-                    logits, _, _ = model(feats.to(device).squeeze(0))
+                    outputs = model(feats.to(device).squeeze(0))
+                    logits = outputs[0]
                     loss_ce = criterion(logits, label.to(device))
                     loss = loss_ce / current_divisor
 
                 scaler.scale(loss).backward()
             else:
-                logits, _, _ = model(feats.to(device).squeeze(0))
+                outputs = model(feats.to(device).squeeze(0))
+                logits = outputs[0]
                 loss_ce = criterion(logits, label.to(device))
                 loss = loss_ce / current_divisor
                 loss.backward()
@@ -383,4 +356,4 @@ def plot_and_save_curves(history, save_dir, iter_idx, seed_idx):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_dir / f"acc_curve_iter{iter_idx}_seed{seed_idx}.png")
-    plt.close()    
+    plt.close()
