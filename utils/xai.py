@@ -148,8 +148,17 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         slide_path = raw_wsis_map[wsi_id]
         slide = openslide.OpenSlide(str(slide_path))
         thumb_factor = 32
+        
         Wl, Hl = slide.level_dimensions[level]
-        thumb = slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor))
+        
+        # --- Apply the cut-in-half logic to the xAI background ---
+        full_thumb = slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor))
+        thumb_arr = np.array(full_thumb.convert("RGB"))
+        half_w_thumb = (Wl // 2) // thumb_factor
+        thumb = thumb_arr[:, :half_w_thumb] # Crop visual to left half
+        
+        Wl = Wl // 2 
+        # ---------------------------------------------------------
         
         heatmap_grid = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=np.float32)
         tissue_mask = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=bool) 
@@ -199,14 +208,9 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                 slide_path=slide_path,
                 coords=coords,
                 importance_scores=importance_scores,
-                features=features,
-                concept_matrix=concept_matrix,
-                concept_phrases=concept_phrases,
                 patch_size=patch_size,
                 level=level,
-                out_dir=out_dir,
-                model=model,    
-                device=device    
+                out_dir=out_dir
             )
         
         # ==========================================
@@ -233,71 +237,17 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         plt.close()
         
         # ==========================================
-        # Concept Alignment and Reporting (Trained Space)
+        # Slide-Level Reporting (Visual Only)
         # ==========================================
-        top_patch_feats = features[top_indices.copy()].to(device)
-        
-        adapted_patch_feats = []
-        with torch.no_grad(), torch.autocast(device_type=device.type):
-            for i in range(len(top_patch_feats)):
-                # Pass each patch individually through the trained model
-                patch_out = model(top_patch_feats[i].unsqueeze(0))
-                adapted_patch_feats.append(patch_out[1].squeeze().cpu().float().numpy())
-                
-        adapted_patch_feats = np.stack(adapted_patch_feats)
-        adapted_patch_feats = F.normalize(torch.tensor(adapted_patch_feats), p=2, dim=-1).numpy()
-        
-        report_header = "Top 15 Patches - Fine-Tuned Model Alignment (Training Concepts)"
-        similarity_matrix = adapted_patch_feats @ concept_matrix.T 
-        
-        # Context-aware filter for top patches to prioritize ALD concepts for ALD predictions
-        ald_keywords = ["steatohepatitis", "chronic liver disease", "macrovesicular steatosis", "alcoholic liver injury", "lipid accumulation"]
-        valid_indices = [i for i, phrase in enumerate(concept_phrases) if any(kw in phrase for kw in ald_keywords)]
-        if not valid_indices: valid_indices = list(range(len(concept_phrases)))
-        
-        with open(out_dir / f"xai_top15_concepts_{wsi_id}.txt", "w") as f:
-            f.write(f"{report_header}\n")
-            f.write("===================================================\n")
-            for i, idx in enumerate(top_indices):
-                patch_sims = similarity_matrix[i]
-                
-                # Mask out Healthy concepts
-                masked_sims = np.full_like(patch_sims, -1.0)
-                masked_sims[valid_indices] = patch_sims[valid_indices]
-                
-                best_concept_idx = int(np.argmax(masked_sims))
-                best_phrase = concept_phrases[best_concept_idx]
-                best_score = masked_sims[best_concept_idx]
-                
-                f.write(f"Rank {i+1:02d} (Patch Index {idx}):\n")
-                f.write(f"  Coordinates  : X={coords[idx][0]:<6}, Y={coords[idx][1]}\n")
-                f.write(f"  Top Match    : {best_phrase}\n")
-                f.write(f"  Cosine Score : {best_score:.4f}\n\n")
-                
-        # --- Slide-Level Reporting ---
-        slide_emb_float = slide_emb.detach().cpu().float()
-        slide_emb_norm = F.normalize(slide_emb_float, p=2, dim=-1).numpy().squeeze()
-        
-        sentence_scores = {}
-        for sentence in target_sentences:
-            sentence_scores[sentence] = float(np.dot(slide_emb_norm, train_text_dict[sentence]))
-                
-        ranked_sentences = sorted(sentence_scores.items(), key=lambda x: x[1], reverse=True)
-
         with open(out_dir / f"xai_report_{wsi_id}.txt", "w") as f:
             f.write("=====================================================\n")
-            f.write(f"      xAI ALIGNMENT & {xai_mode.upper()} REPORT\n")
+            f.write(f"      xAI VISUAL ATTENTION REPORT\n")
             f.write("=====================================================\n\n")
             f.write(f"Model Architecture Used : {args.model}\n")
             f.write(f"Evaluated WSI Subject ID: {wsi_id}\n")
             f.write(f"Generated from Iteration: {iter_idx} | Seed: {seed_idx}\n")
             
             f.write(mass_msg) 
-            
-            f.write("\n--- Slide-Level Semantic Alignment (Adapted Space) ---\n")
-            f.write("Cosine Similarity (-1 to +1) of the final aggregated WSI embedding against training concepts:\n")
-            for rank, (sentence, score) in enumerate(ranked_sentences):
-                f.write(f"{rank+1:02d}. Score: {score:+.4f} | {sentence}\n")
             
             f.write("\n--- Patch-Level Saliency (Top 15) ---\n")
             for rank, idx in enumerate(top_indices):

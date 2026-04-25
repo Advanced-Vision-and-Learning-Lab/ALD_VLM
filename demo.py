@@ -52,43 +52,25 @@ if CACHE_DIR.exists() and any(CACHE_DIR.iterdir()):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-INSTANCE_TEMPLATES = [
-    "A high-magnification H&E stained liver tissue patch exhibiting {}.", 
-    "A microscopic pathology view revealing {}."
-]
-
-INSTANCE_CONCEPTS = {
-    "Healthy Liver": [
-        "orderly cords of normal hepatocytes", 
-        "uniform hepatocytes with dense granular eosinophilic cytoplasm", 
-        "centrally located hepatocyte nuclei with smooth nuclear contours", 
-        "clear hepatic sinusoids lined by thin endothelial cells", 
-        "structurally intact portal tracts with normal bile ducts and vessels"
-    ],
-    "Alcoholic Liver Disease": [
-        "macrovesicular steatosis with large lipid droplets", 
-        "microvesicular steatosis with foamy hepatocyte cytoplasm", 
-        "hepatocyte ballooning degeneration with cellular swelling",
-        "Mallory-Denk bodies within degenerating hepatocytes", 
-        "neutrophilic lobular inflammation", 
-        "perisinusoidal bridging fibrosis" 
-    ]
-}
-
 BAG_PROMPTS = {
     "Healthy Liver": [
-        "A comprehensive whole slide image pathology diagnosis indicating normal liver architecture with preserved lobular structure.",
-        "A comprehensive whole slide image pathology diagnosis indicating healthy hepatic tissue with intact portal and central vein relationships.",
-        "An H&E stained tissue section showing unremarkable hepatocytes arranged in regular cords.",
-        "Microscopic examination of the liver reveals standard lobular organization and clear sinusoids.",
-        "A routine H&E pathology slide displaying typical hepatic parenchyma and regular cellular morphology."
+        "An H&E stained liver slide showing normal hepatocyte cords.",
+        "Microscopic evaluation of a liver slide revealing clear hepatic sinusoids.",
+        "A pathology slide of liver slide demonstrating intact portal tracts.",
+        "Whole slide imaging of a liver section displaying normal central veins.",
+        "Histopathological examination of a healthy liver slide showing uniform hepatocytes."
     ],
     "Alcoholic Liver Disease": [
-        "A comprehensive whole slide image pathology diagnosis indicating steatohepatitis with concurrent steatosis, inflammation, and cellular injury.",
-        "A comprehensive whole slide image pathology diagnosis indicating chronic liver disease characterized by widespread steatosis and lobular inflammation.",
-        "An H&E stained section demonstrating severe macrovesicular steatosis accompanied by hepatocyte ballooning.",
-        "Microscopic evaluation reveals characteristic alcoholic liver injury including Mallory-Denk bodies and neutrophilic infiltrates.",
-        "Pathology evaluation of the hepatic tissue highlights prominent lipid accumulation, lobular inflammation, and pericellular fibrosis."
+        "An H&E stained liver slide showing macrovesicular steatosis.",
+        "Microscopic evaluation of a liver slide revealing microvesicular steatosis.",
+        "A pathology slide of liver slide demonstrating hepatocyte ballooning.",
+        "Whole slide imaging of a liver slide displaying Mallory-Denk bodies.",
+        "Histopathological examination of a liver slide showing neutrophilic infiltrate.",
+        "An H&E stained liver slide exhibiting lobular inflammation.",
+        "Microscopic evaluation of a liver slide demonstrating portal inflammation.",
+        "A pathology slide of liver slide showing pericellular fibrosis.",
+        "Whole slide imaging of a liver section revealing bridging fibrosis.",
+        "Histopathological examination of a liver slide displaying apoptotic bodies."
     ]
 }
 
@@ -111,6 +93,10 @@ def generate_tissue_mask(slide, thumb_factor=32):
     Wl, Hl = slide.level_dimensions[LEVEL]
     thumb = slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor))
     thumb_arr = np.array(thumb.convert("RGB"))
+
+    # Crop thumbnail to only the LEFT half
+    half_w_thumb = (Wl // 2) // thumb_factor
+    thumb_arr = thumb_arr[:, :half_w_thumb]
 
     hsv = cv2.cvtColor(thumb_arr, cv2.COLOR_RGB2HSV)
     S = hsv[:, :, 1]
@@ -167,6 +153,8 @@ def _extract_patches_worker(slide_path):
     mask, _, _ = generate_tissue_mask(slide, thumb_factor)
     
     Wl, Hl = slide.level_dimensions[LEVEL]
+    Wl = Wl // 2  
+    
     kept_coords = []
     downsample = float(slide.level_downsamples[LEVEL])
     p_size_thumb = PATCH_SIZE // thumb_factor
@@ -244,33 +232,6 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
     
     np.save(FEATURES_DIR / "bag_embeddings.npy", np.stack(bag_feats_list))
     torch.save(text_to_feature_dict, FEATURES_DIR / "training_text_embeddings.pt")
-
-    # Instance-Level Extraction
-    instance_feats_list = []
-    concept_dict = {}
-    pure_concept_dict = {}
-    
-    with torch.no_grad():
-        for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
-            for concept in INSTANCE_CONCEPTS[cls]:
-                # Pure concept
-                inputs = tokenizer([concept], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
-                outputs = model.encode_text(inputs["input_ids"].to(device))
-                feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
-                pure_concept_dict[concept] = feat
-                
-                # Templated concepts
-                for t in INSTANCE_TEMPLATES:
-                    prompt = t.format(concept)
-                    inputs = tokenizer([prompt], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
-                    outputs = model.encode_text(inputs["input_ids"].to(device))
-                    feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
-                    concept_dict[prompt] = feat
-                    instance_feats_list.append(feat)
-                    
-    np.save(FEATURES_DIR / "instance_embeddings.npy", np.stack(instance_feats_list))
-    torch.save(concept_dict, FEATURES_DIR / "concept_embeddings.pt")
-    torch.save(pure_concept_dict, FEATURES_DIR / "pure_concept_embeddings.pt")
     
     extracted_all = all((FEATURES_DIR / f"{s}_features.pt").exists() for s in valid_subjects)
     if extracted_all:
@@ -421,7 +382,7 @@ if __name__ == "__main__":
         
     run_feature_extraction(device, valid_subjects, SUBJECT_META)
     bag_embeddings = np.load(FEATURES_DIR / "bag_embeddings.npy")
-    instance_embeddings = np.load(FEATURES_DIR / "instance_embeddings.npy")
+    instance_embeddings = None  
     
     flat_val_baccs, flat_test_baccs, flat_test_aucs, flat_test_f1s, flat_epochs = [], [], [], [], []
     combo_report_logs, xai_infos = [], []
