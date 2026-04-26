@@ -12,9 +12,14 @@ def apply_text_pooling(logits, text_pool, num_healthy=15):
     """Pools text similarities to 2 classes if LogSumExp is enabled."""
     if text_pool == "mean":
         return logits # Shape is already (N, 2)
+        
     # If LSE, logits shape is (N, 45)
-    logit_healthy = torch.logsumexp(logits[:, :num_healthy], dim=1)
-    logit_ald = torch.logsumexp(logits[:, num_healthy:], dim=1)
+    num_ald = logits.shape[1] - num_healthy
+    
+    # Normalize by subtracting the log of the pool size
+    logit_healthy = torch.logsumexp(logits[:, :num_healthy], dim=1) - np.log(num_healthy)
+    logit_ald = torch.logsumexp(logits[:, num_healthy:], dim=1) - np.log(num_ald)
+    
     return torch.stack([logit_healthy, logit_ald], dim=-1)
     
 class ABMIL(nn.Module):
@@ -172,3 +177,50 @@ class TaskResModel(nn.Module):
         logits = apply_text_pooling(raw_logits, self.text_pool)
         
         return logits, embedding_norm, w
+        
+class DualAdaptModel(nn.Module):
+    """
+    Combines both Visual Adapter (MLP) and Semantic Adapter (TaskRes)
+    for simultaneous dual-modality alignment.
+    """
+    def __init__(self, text_embeddings, reduction=4, alpha=0.25, abmil_d=64, text_pool="mean"):
+        super().__init__()
+        self.c_in = 512
+        self.reduction = reduction
+        self.alpha = alpha
+        self.ratio = 0.2
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
+        self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
+        self.task_res = nn.Parameter(torch.zeros_like(self.text_embeddings))
+        self.text_pool = text_pool
+        
+        self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
+            
+        self.adapter = nn.Sequential(
+            nn.Linear(self.c_in, self.c_in // self.reduction, bias=False),
+            nn.LayerNorm(self.c_in // self.reduction),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.25),
+            nn.Linear(self.c_in // self.reduction, self.c_in, bias=False),
+        )
+        nn.init.zeros_(self.adapter[4].weight)
+
+    def forward(self, features):
+        # 1. Semantic Adaptation (TaskRes)
+        adapted_prototype = self.text_embeddings + self.alpha * self.task_res
+        prototype_norm = F.normalize(adapted_prototype, p=2, dim=-1)
+        
+        # 2. Visual Aggregation
+        embedding, w = self.aggregator(features)
+            
+        # 3. Visual Adaptation (Adapter)
+        res = self.adapter(embedding)
+        adapted_emb = self.ratio * res + (1 - self.ratio) * embedding
+        adapted_emb_norm = F.normalize(adapted_emb, p=2, dim=-1)
+        
+        # 4. Dual-Space Cosine Similarity
+        clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
+        raw_logits = (adapted_emb_norm @ prototype_norm.t()) * clamped_scale
+        logits = apply_text_pooling(raw_logits, self.text_pool)
+        
+        return logits, adapted_emb_norm, w        

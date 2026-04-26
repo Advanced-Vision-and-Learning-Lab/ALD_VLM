@@ -25,7 +25,8 @@ from .mil_models import (
     ABMILAdapterModel, 
     ZSMILModel, 
     TaskResModel, 
-    MaxPoolModel
+    MaxPoolModel, 
+    DualAdaptModel
 )
 
 class WSIPatchDataset(Dataset):
@@ -219,7 +220,9 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     elif args.model == "zsmil":
         model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "dual_adapt":
+        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":
         model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool).to(device)
         

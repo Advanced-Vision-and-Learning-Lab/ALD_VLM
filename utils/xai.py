@@ -19,7 +19,8 @@ from .mil_models import (
     ABMILAdapterModel,
     ZSMILModel,
     TaskResModel,
-    MaxPoolModel
+    MaxPoolModel,
+    DualAdaptModel
 )
 
 from .xai_callout import generate_zoomed_callout 
@@ -33,7 +34,9 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
     elif args.model == "zsmil":
         model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "dual_adapt":
+        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":
         model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool)
     else:
@@ -140,10 +143,16 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         # --- Slide-Level Text Semantic Matching ---
         with torch.no_grad(), torch.autocast(device_type=device.type):
             all_text_feats = torch.tensor(concept_matrix).to(device)
+            
+            # Dynamically shift the text space if the model uses TaskRes / Dual Adapt
+            if hasattr(model, 'task_res'):
+                alpha = getattr(model, 'alpha', 0.25)
+                all_text_feats = all_text_feats + alpha * model.task_res
+
             all_text_norm = F.normalize(all_text_feats, p=2, dim=-1)
             slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
             
-            # Compute similarities against ALL 45 prompts
+            # Compute similarities against ALL dynamically shifted prompts
             text_sims = (slide_emb_norm @ all_text_norm.t()).squeeze()
             
             # Extract the top 3 highest scores and their indices
@@ -220,6 +229,54 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         plt.close()
         
         if xai_mode == "Visual-Attention":
+            local_text_match = None
+            
+            # If the model uses LSE pooling (has individual concept resolution), do Regional Computation
+            if args.text_pool == "lse":
+                # 1. Re-locate the exact bounding box center (same math as xai_callout.py)
+                p_size_thumb = patch_size // thumb_factor
+                heatmap_smoothed_flat = scipy.ndimage.gaussian_filter(heatmap_grid, sigma=p_size_thumb)
+                max_ty, max_tx = np.unravel_index(np.argmax(heatmap_smoothed_flat), heatmap_smoothed_flat.shape)
+                center_x = max_tx * thumb_factor
+                center_y = max_ty * thumb_factor
+                
+                offset = (6 // 2) * patch_size # zoom_window_patches = 6
+                zx_start = center_x - offset
+                zy_start = center_y - offset
+                zx_end = center_x + offset
+                zy_end = center_y + offset
+                
+                # 2. Find which patches fall inside this bounding box
+                local_features = []
+                for idx, (x, y) in enumerate(coords):
+                    if zx_start <= x <= zx_end and zy_start <= y <= zy_end:
+                        local_features.append(features[idx])
+                        
+                if local_features:
+                    # 3. Aggregate local features
+                    local_feats_tensor = torch.stack(local_features)
+                    
+                    with torch.no_grad(), torch.autocast(device_type=device.type):
+                        # Use the aggregator to pool just the local patches
+                        local_emb, _ = model.aggregator(local_feats_tensor)
+                        
+                        # Apply Adapter if present
+                        if hasattr(model, 'adapter'):
+                            res = model.adapter(local_emb)
+                            ratio = getattr(model, 'ratio', 0.2)
+                            local_emb = ratio * res + (1 - ratio) * local_emb
+                            
+                        local_emb_norm = F.normalize(local_emb, p=2, dim=-1)
+                        
+                        local_text_sims = (local_emb_norm @ all_text_norm.t()).squeeze()
+                        best_local_idx = torch.argmax(local_text_sims).item()
+                        best_local_score = local_text_sims[best_local_idx].item()
+                        
+                        local_text_match = f"'{target_sentences[best_local_idx]}'"
+
+                        text_msg += f"\n--- Regional Callout Semantic Match ---\n{local_text_match} (Sim: {best_local_score:.2f})\n"
+                        
+            # 4. Generate the plot, passing the local text string if computed
             generate_zoomed_callout(
                 wsi_id=wsi_id,
                 slide_path=slide_path,
@@ -227,7 +284,8 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                 importance_scores=importance_scores,
                 patch_size=patch_size,
                 level=level,
-                out_dir=out_dir
+                out_dir=out_dir,
+                local_concept_text=local_text_match
             )
         
         # ==========================================

@@ -19,6 +19,7 @@ def generate_zoomed_callout(
     patch_size,
     level,
     out_dir,
+    local_concept_text=None,
     zoom_window_patches=6
 ):
     """
@@ -115,8 +116,11 @@ def generate_zoomed_callout(
     ax_zoom.set_xticks([])
     ax_zoom.set_yticks([])
 
-    title_text = "High Attention Region\n(Highest Density Visual Cluster)"
-    ax_zoom.set_title(title_text, fontsize=15, color='darkred', fontweight='bold', pad=20)
+    title_text = "High Attention Region"
+    if local_concept_text:
+        title_text += f"\n\nLocal Concept Match:\n{local_concept_text}"
+        
+    ax_zoom.set_title(title_text, fontsize=14, color='darkred', fontweight='bold', pad=15)
 
     plt.tight_layout()
     plt.savefig(callout_dir / f"xai_callout_{wsi_id}.png", bbox_inches='tight')

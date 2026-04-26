@@ -276,7 +276,8 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool",], default="abmil_adapter")
+    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "dual_adapt"], default="abmil_adapter")
+    parser.add_argument('--alpha', type=float, default=0.25, help="TaskRes alpha parameter to control text adaptation strength.")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--text_pool', type=str, choices=["mean", "lse"], default="mean", help="aggregate text prompts (mean or log-sum-exp).")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
@@ -359,6 +360,8 @@ if __name__ == "__main__":
     SPLITS_JSON_PATH = SHARED_SPLITS_DIR / f"dataset_splits_{args.shots}shot_{args.iterations}iter_{int(args.dataset_pct*100)}pct.json"
     
     if args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}_{args.text_pool}"
+    elif args.model == "dual_adapt": model_str = f"{args.model}_r{args.reduction}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
+    elif args.model == "taskres": model_str = f"{args.model}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}_{args.text_pool}"
     else: model_str = f"{args.model}_d{args.abmil_d}_{args.text_pool}"
 
