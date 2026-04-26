@@ -1,9 +1,6 @@
 """
 xai_callout.py
-
 Module for generating interpretability visualizations for Whole Slide Images (WSIs).
-Produces a side-by-side figure containing a global spatial attention heatmap 
-and a high-resolution regional callout centered on the densest attention cluster.
 """
 
 import numpy as np

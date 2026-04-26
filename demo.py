@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 # Internal utility imports
 from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold, plot_and_save_curves
 from utils.xai import run_xai_analysis
+from utils.roc_plot import save_roc_curve
 
 # ==========================================
 # CONFIGURATION & DIRECTORIES
@@ -52,26 +53,23 @@ if CACHE_DIR.exists() and any(CACHE_DIR.iterdir()):
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_OFFLINE"] = "1"
 
+PREFIXES = [
+    "An H&E stained liver slide showing ",
+    "Microscopic evaluation of a liver slide revealing ",
+    "Histopathological examination of a liver slide displaying "
+]
+HEALTHY_MARKERS = [
+    "normal hepatocyte cords.", "clear hepatic sinusoids.", 
+    "intact portal tracts.", "normal central veins.", "uniform hepatocytes."
+]
+ALD_MARKERS = [
+    "macrovesicular steatosis.", "microvesicular steatosis.", "hepatocyte ballooning.", 
+    "Mallory-Denk bodies.", "neutrophilic infiltrate.", "lobular inflammation.", 
+    "portal inflammation.", "pericellular fibrosis.", "bridging fibrosis.", "apoptotic bodies."
+]
 BAG_PROMPTS = {
-    "Healthy Liver": [
-        "An H&E stained liver slide showing normal hepatocyte cords.",
-        "Microscopic evaluation of a liver slide revealing clear hepatic sinusoids.",
-        "A pathology slide of liver slide demonstrating intact portal tracts.",
-        "Whole slide imaging of a liver section displaying normal central veins.",
-        "Histopathological examination of a healthy liver slide showing uniform hepatocytes."
-    ],
-    "Alcoholic Liver Disease": [
-        "An H&E stained liver slide showing macrovesicular steatosis.",
-        "Microscopic evaluation of a liver slide revealing microvesicular steatosis.",
-        "A pathology slide of liver slide demonstrating hepatocyte ballooning.",
-        "Whole slide imaging of a liver slide displaying Mallory-Denk bodies.",
-        "Histopathological examination of a liver slide showing neutrophilic infiltrate.",
-        "An H&E stained liver slide exhibiting lobular inflammation.",
-        "Microscopic evaluation of a liver slide demonstrating portal inflammation.",
-        "A pathology slide of liver slide showing pericellular fibrosis.",
-        "Whole slide imaging of a liver section revealing bridging fibrosis.",
-        "Histopathological examination of a liver slide displaying apoptotic bodies."
-    ]
+    "Healthy Liver": [p + m for p in PREFIXES for m in HEALTHY_MARKERS], # 15 Prompts
+    "Alcoholic Liver Disease": [p + m for p in PREFIXES for m in ALD_MARKERS] # 30 Prompts
 }
 
 def set_seed(seed=42):
@@ -227,10 +225,14 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
                 cls_feats.append(feat)
                 text_to_feature_dict[prompt] = feat 
                 
-            cls_prototype = np.mean(cls_feats, axis=0)
-            bag_feats_list.append(cls_prototype / np.linalg.norm(cls_prototype))
+            if args.text_pool == "mean":
+                cls_prototype = np.mean(cls_feats, axis=0)
+                bag_feats_list.append(cls_prototype / np.linalg.norm(cls_prototype))
+            else:
+                for feat in cls_feats: # LSE mode saves all 45 un-averaged features
+                    bag_feats_list.append(feat / np.linalg.norm(feat))
     
-    np.save(FEATURES_DIR / "bag_embeddings.npy", np.stack(bag_feats_list))
+    np.save(FEATURES_DIR / f"bag_embeddings_{args.text_pool}.npy", np.stack(bag_feats_list))
     torch.save(text_to_feature_dict, FEATURES_DIR / "training_text_embeddings.pt")
     
     extracted_all = all((FEATURES_DIR / f"{s}_features.pt").exists() for s in valid_subjects)
@@ -274,12 +276,9 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices=[
-        "abmil_adapter", "zsmil", "taskres", "max_pool", "pre_agg_semantic"
-    ], default="abmil_adapter")
-    parser.add_argument('--max_pool_head', type=str, choices=[
-        "none", "adapter", "taskres"
-    ], default="none")
+    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool",], default="abmil_adapter")
+    parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
+    parser.add_argument('--text_pool', type=str, choices=["mean", "lse"], default="mean", help="aggregate text prompts (mean or log-sum-exp).")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
     parser.add_argument('--reduction', type=int, default=8, help="Adapter bottleneck reduction factor.")
@@ -359,9 +358,9 @@ if __name__ == "__main__":
     SHARED_SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_JSON_PATH = SHARED_SPLITS_DIR / f"dataset_splits_{args.shots}shot_{args.iterations}iter_{int(args.dataset_pct*100)}pct.json"
     
-    if args.model in ["abmil_adapter", "pre_agg_semantic"]: model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}"
-    elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}"
-    else: model_str = f"{args.model}_d{args.abmil_d}"
+    if args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}_{args.text_pool}"
+    elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}_{args.text_pool}"
+    else: model_str = f"{args.model}_d{args.abmil_d}_{args.text_pool}"
 
     DYNAMIC_RESULTS_DIR = STANDALONE_DIR / f"{model_str}_{args.shots}shot_{args.iterations}iter"
 
@@ -381,7 +380,7 @@ if __name__ == "__main__":
         list(tqdm(ex.map(_extract_patches_worker, list(raw_wsis.values())), total=len(raw_wsis)))
         
     run_feature_extraction(device, valid_subjects, SUBJECT_META)
-    bag_embeddings = np.load(FEATURES_DIR / "bag_embeddings.npy")
+    bag_embeddings = np.load(FEATURES_DIR / f"bag_embeddings_{args.text_pool}.npy")
     instance_embeddings = None  
     
     flat_val_baccs, flat_test_baccs, flat_test_aucs, flat_test_f1s, flat_epochs = [], [], [], [], []
@@ -444,6 +443,18 @@ if __name__ == "__main__":
                 f.write("\n".join(txt_lines))
 
             plot_and_save_curves(history, CURVES_DIR, fold_idx, n_seed)
+
+            # Save ROC Curve for the Test Set ---
+            test_targets = [1 if subj in D_POOL else 0 for subj in test_ids]
+            test_probs_list = [eval_probs.get(subj, 0.0) for subj in test_ids]
+            
+            roc_save_path = CURVES_DIR / f"roc_curve_iter{fold_idx:02d}_seed{n_seed}.png"
+            save_roc_curve(
+                targets=test_targets, 
+                probs=test_probs_list, 
+                save_path=roc_save_path, 
+                title_prefix=f"Iter {fold_idx} (Seed {n_seed})"
+            )
 
             fold_val_bacc.append(val_bacc)
             fold_test_bacc.append(test_bacc)

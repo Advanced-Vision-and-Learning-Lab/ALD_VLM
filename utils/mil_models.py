@@ -8,6 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def apply_text_pooling(logits, text_pool, num_healthy=15):
+    """Pools text similarities to 2 classes if LogSumExp is enabled."""
+    if text_pool == "mean":
+        return logits # Shape is already (N, 2)
+    # If LSE, logits shape is (N, 45)
+    logit_healthy = torch.logsumexp(logits[:, :num_healthy], dim=1)
+    logit_ald = torch.logsumexp(logits[:, num_healthy:], dim=1)
+    return torch.stack([logit_healthy, logit_ald], dim=-1)
+    
 class ABMIL(nn.Module):
     """
     Standard Attention-Based Multiple Instance Learning (ABMIL) aggregation.
@@ -86,14 +95,14 @@ class MaxPoolModel(nn.Module):
         return logits, embedding_norm, w
 
 class ABMILAdapterModel(nn.Module):
-    def __init__(self, text_embeddings, reduction=4, abmil_d=64):
+    def __init__(self, text_embeddings, reduction=4, abmil_d=64, text_pool="mean"):
         super().__init__()
         self.c_in = 512
         self.reduction = reduction
         self.ratio = 0.2
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
-        
+        self.text_pool = text_pool
         self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
             
         self.adapter = nn.Sequential(
@@ -115,17 +124,20 @@ class ABMILAdapterModel(nn.Module):
         adapted_emb = F.normalize(adapted_emb, p=2, dim=-1)
         
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = (adapted_emb @ prototype_norm.t()) * clamped_scale
+
+        raw_logits = (adapted_emb @ prototype_norm.t()) * clamped_scale
+        logits = apply_text_pooling(raw_logits, self.text_pool)
         
         return logits, adapted_emb, w
 
 class ZSMILModel(nn.Module):
-    def __init__(self, text_embeddings, abmil_d=64):
+    def __init__(self, text_embeddings, abmil_d=64, text_pool="mean"):
         super().__init__()
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.aggregator = ABMIL(L=512, D=abmil_d)
-
+        self.text_pool = text_pool
+        
     def forward(self, features):
         prototype_norm = F.normalize(self.text_embeddings, p=2, dim=-1)
         
@@ -133,18 +145,19 @@ class ZSMILModel(nn.Module):
             
         embedding_norm = F.normalize(embedding, p=2, dim=-1)
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
+        raw_logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
+        logits = apply_text_pooling(raw_logits, self.text_pool)
         
         return logits, embedding_norm, w
 
 class TaskResModel(nn.Module):
-    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64):
+    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64, text_pool="mean"):
         super().__init__()
         self.alpha = alpha
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.task_res = nn.Parameter(torch.zeros_like(self.text_embeddings))
-        
+        self.text_pool = text_pool
         self.aggregator = ABMIL(L=512, D=abmil_d)
 
     def forward(self, features):
@@ -155,51 +168,7 @@ class TaskResModel(nn.Module):
             
         embedding_norm = F.normalize(embedding, p=2, dim=-1)
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
-        
-        return logits, embedding_norm, w
-
-class PreAggSemanticModel(nn.Module):
-    """
-    Pre-Aggregation Semantic Adaptation Model.
-    Shifts and L2-normalizes every individual tissue patch into the semantic space 
-    BEFORE passing them into the ABMIL gated attention mechanism.
-    """
-    def __init__(self, text_embeddings, reduction=8, abmil_d=64):
-        super().__init__()
-        self.c_in = 512
-        self.reduction = reduction
-        self.ratio = 0.2
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
-        self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
-        
-        # Patch-Level translation (bridging modality gap microscopically)
-        self.patch_translator = nn.Sequential(
-            nn.Linear(self.c_in, self.c_in // self.reduction, bias=False),
-            nn.LayerNorm(self.c_in // self.reduction),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.25),
-            nn.Linear(self.c_in // self.reduction, self.c_in, bias=False),
-        )
-        nn.init.zeros_(self.patch_translator[4].weight)
-        
-        # Standard ABMIL that now evaluates the semantically translated patches
-        self.aggregator = ABMIL(L=self.c_in, D=abmil_d)
-
-    def forward(self, features):
-        prototype_norm = F.normalize(self.text_embeddings, p=2, dim=-1)
-        
-        # 1. Translate and explicitly L2-normalize every single patch
-        res = self.patch_translator(features)
-        translated_patches = self.ratio * res + (1 - self.ratio) * features
-        translated_patches_norm = F.normalize(translated_patches, p=2, dim=-1)
-        
-        # 2. Score and aggregate the adapted patches
-        embedding, w = self.aggregator(translated_patches_norm)
-            
-        # 3. Final classification computation
-        embedding_norm = F.normalize(embedding, p=2, dim=-1)
-        clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
-        logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
+        raw_logits = (embedding_norm @ prototype_norm.t()) * clamped_scale
+        logits = apply_text_pooling(raw_logits, self.text_pool)
         
         return logits, embedding_norm, w

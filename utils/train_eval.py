@@ -25,8 +25,7 @@ from .mil_models import (
     ABMILAdapterModel, 
     ZSMILModel, 
     TaskResModel, 
-    MaxPoolModel, 
-    PreAggSemanticModel
+    MaxPoolModel
 )
 
 class WSIPatchDataset(Dataset):
@@ -216,15 +215,13 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
     
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
-    elif args.model == "pre_agg_semantic":
-        model = PreAggSemanticModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
+        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d).to(device)
+        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25).to(device)
+        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool).to(device)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     

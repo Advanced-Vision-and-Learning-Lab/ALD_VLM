@@ -1,8 +1,6 @@
 """
 xai.py
 Explainable AI (xAI) Module.
-Interprets MIL model decisions through semantic attention heatmaps, 
-Integrated Gradients, and fine-tuned text-to-patch alignment using the trained model space.
 """
 
 import logging
@@ -21,8 +19,7 @@ from .mil_models import (
     ABMILAdapterModel,
     ZSMILModel,
     TaskResModel,
-    MaxPoolModel,
-    PreAggSemanticModel
+    MaxPoolModel
 )
 
 from .xai_callout import generate_zoomed_callout 
@@ -32,15 +29,13 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
     Reconstructs the specified model architecture for xAI evaluation.
     """
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
-    elif args.model == "pre_agg_semantic":
-        model = PreAggSemanticModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d).to(device)
+        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d)
+        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=0.25, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25)
+        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool)
     else:
         raise ValueError(f"Unknown model type: {args.model}")
         
@@ -142,6 +137,25 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                 slide_emb = outputs[1]
             mass_msg = "\n--- Decision Mass Diagnostics ---\nN/A for Gradient-Based methods.\n"
             
+        # --- Slide-Level Text Semantic Matching ---
+        with torch.no_grad(), torch.autocast(device_type=device.type):
+            all_text_feats = torch.tensor(concept_matrix).to(device)
+            all_text_norm = F.normalize(all_text_feats, p=2, dim=-1)
+            slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
+            
+            # Compute similarities against ALL 45 prompts
+            text_sims = (slide_emb_norm @ all_text_norm.t()).squeeze()
+            
+            # Extract the top 3 highest scores and their indices
+            top_k = 3
+            top_scores, top_indices = torch.topk(text_sims, k=top_k)
+            
+            text_msg = f"\n--- Top {top_k} Matched Semantic Concepts ---\n"
+            for rank, (score, idx) in enumerate(zip(top_scores.tolist(), top_indices.tolist())):
+                text_msg += (f"Rank {rank + 1}:\n"
+                             f"  Concept: '{target_sentences[idx]}'\n"
+                             f"  Similarity: {score:.4f}\n")
+            
         # ==========================================
         # Heatmap Generation
         # ==========================================
@@ -196,7 +210,10 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
         sm.set_array([]) 
         cbar = fig.colorbar(sm, cax=cax)
-        cbar.set_label('Relative Patch Importance', rotation=270, labelpad=20, fontsize=12)
+        
+        cbar.set_label('Relative Patch Importance', rotation=270, labelpad=25, fontsize=16)
+        
+        cbar.ax.tick_params(labelsize=14)
         
         plt.tight_layout()
         plt.savefig(out_dir / f"xai_heatmap_overlay_{wsi_id}.png", bbox_inches='tight')
@@ -237,7 +254,7 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         plt.close()
         
         # ==========================================
-        # Slide-Level Reporting (Visual Only)
+        # Slide-Level Reporting (Visual + Semantic)
         # ==========================================
         with open(out_dir / f"xai_report_{wsi_id}.txt", "w") as f:
             f.write("=====================================================\n")
@@ -248,6 +265,7 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
             f.write(f"Generated from Iteration: {iter_idx} | Seed: {seed_idx}\n")
             
             f.write(mass_msg) 
+            f.write(text_msg)
             
             f.write("\n--- Patch-Level Saliency (Top 15) ---\n")
             for rank, idx in enumerate(top_indices):
