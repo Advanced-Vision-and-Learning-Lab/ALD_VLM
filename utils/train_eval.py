@@ -1,8 +1,7 @@
 """
 train_eval.py
 Training, Evaluation, and Dataset Modules.
-Provides utilities for dataset handling, stratified splitting, 
-and the main training/validation loops for the MIL models.
+Provides utilities for dataset handling, stratified splitting, and the main training/validation loops.
 """
 
 import os
@@ -26,7 +25,9 @@ from .mil_models import (
     ZSMILModel, 
     TaskResModel, 
     MaxPoolModel, 
-    DualAdaptModel
+    NLTaskResModel,
+    DualAdaptModel,
+    AffineTaskResModel
 )
 
 class WSIPatchDataset(Dataset):
@@ -221,6 +222,10 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
         model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "taskres":
         model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "nl_taskres":
+        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "affine_taskres":
+        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "dual_adapt":
         model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":

@@ -20,7 +20,9 @@ from .mil_models import (
     ZSMILModel,
     TaskResModel,
     MaxPoolModel,
-    DualAdaptModel
+    DualAdaptModel,
+    NLTaskResModel,
+    AffineTaskResModel
 )
 
 from .xai_callout import generate_zoomed_callout 
@@ -35,6 +37,10 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
         model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
     elif args.model == "taskres":
         model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "nl_taskres":
+        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+    elif args.model == "affine_taskres":
+        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "dual_adapt":
         model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
     elif args.model == "max_pool":
@@ -144,10 +150,19 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         with torch.no_grad(), torch.autocast(device_type=device.type):
             all_text_feats = torch.tensor(concept_matrix).to(device)
             
-            # Dynamically shift the text space if the model uses TaskRes / Dual Adapt
+            if hasattr(model, 'task_scale') and hasattr(model, 'task_shift'):
+                alpha = getattr(model, 'alpha', 0.25)
+                # Apply the exact affine transform from the forward pass
+                all_text_feats = (model.task_scale * all_text_feats) + (alpha * model.task_shift)
+            
             if hasattr(model, 'task_res'):
                 alpha = getattr(model, 'alpha', 0.25)
                 all_text_feats = all_text_feats + alpha * model.task_res
+
+            elif hasattr(model, 'semantic_adapter'):
+                alpha = getattr(model, 'alpha', 0.25)
+                # Compute the forward pass of the text through the trained adapter
+                all_text_feats = all_text_feats + alpha * model.semantic_adapter(all_text_feats)
 
             all_text_norm = F.normalize(all_text_feats, p=2, dim=-1)
             slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)

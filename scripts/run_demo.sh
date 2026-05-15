@@ -1,47 +1,42 @@
 #!/bin/bash
 
-# Define the exact 9 combinations to match the new Table: "model max_pool_head learning_rate"
-runs=(
-    # --- BASELINES ---
-    "max_pool none 1e-3"
-    "max_pool adapter 4e-4"
-    "max_pool taskres 1e-3"
-    
-    # --- ORIGINAL VISUAL ABMIL ---
-    "zsmil none 1e-3"
-    "taskres none 1e-3"
-    "abmil_adapter none 4e-4"
-    
-    # --- NOVEL CROSS-ATTENTION ---
-    "cross_attn none 1e-3"
-    "cross_attn_adapter none 4e-4"
-    "cross_attn_taskres none 1e-3"
-)
+# Configuration Arrays
+SHOTS=(1 4)
+POOLS=("mean" "lse")
+MODELS=("zsmil" "abmil_adapter" "taskres" "dual_adapt")
 
-for shots in 1 4 8; do
-    echo "======================================================="
-    echo "  EVALUATING: ${shots} SHOT(S) | 10 ITERS | 3 SEEDS"
-    echo "======================================================="
+# Fixed Hyperparameters
+ABMIL_D=64
+REDUCTION=4
+LR=5e-4
+ITERATIONS=10
+SEEDS=3
+PATIENCE=50
+EPOCHS=250
 
-    for run in "${runs[@]}"; do
-        # Parse the string into variables
-        read -r model head lr <<< "$run"
-        
-        echo "--> Running $model with head=$head (LR: $lr)"
-        python demo.py \
-            --model "$model" \
-            --max_pool_head "$head" \
-            --epochs 250 \
-            --lr "$lr" \
-            --reduction 8 \
-            --abmil_d 64 \
-            --ortho_weight 0.1 \
-            --shots "$shots" \
-            --iterations 10 \
-            --dataset_pct 1.0 \
-            --seeds 3 \
-            --patience 50
+echo "Starting Few-Shot WSI Experiments..."
+
+for SHOT in "${SHOTS[@]}"; do
+    for POOL in "${POOLS[@]}"; do
+        for MODEL in "${MODELS[@]}"; do
+            echo "======================================================================"
+            echo "Running: Model=$MODEL | Shots=$SHOT | Text Pool=$POOL"
+            echo "======================================================================"
+
+            python demo.py \
+                --model "$MODEL" \
+                --text_pool "$POOL" \
+                --shots "$SHOT" \
+                --abmil_d "$ABMIL_D" \
+                --reduction "$REDUCTION" \
+                --lr "$LR" \
+                --iterations "$ITERATIONS" \
+                --seeds "$SEEDS" \
+                --patience "$PATIENCE" \
+                --epochs "$EPOCHS"
+                
+        done
     done
 done
 
-
+echo "All experiments completed!"

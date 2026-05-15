@@ -1,7 +1,6 @@
 """
 demo.py
-Few-Shot Multiple Instance Learning (MIL) Evaluation Pipeline.
-Main execution script for WSI processing, feature extraction, and model training.
+Few-Shot Multiple Instance Learning (MIL) Pipeline.
 """
 
 import argparse
@@ -28,6 +27,16 @@ import matplotlib.pyplot as plt
 from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold, plot_and_save_curves
 from utils.xai import run_xai_analysis
 from utils.roc_plot import save_roc_curve
+
+from utils.mil_models import (
+    ABMILAdapterModel, 
+    ZSMILModel, 
+    TaskResModel, 
+    MaxPoolModel, 
+    DualAdaptModel,
+    NLTaskResModel,
+    AffineTaskResModel
+)
 
 # ==========================================
 # CONFIGURATION & DIRECTORIES
@@ -276,7 +285,8 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres", "max_pool", "dual_adapt"], default="abmil_adapter")
+    parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres",
+    "affine_taskres", "max_pool", "dual_adapt", "nl_taskres"], default="abmil_adapter")
     parser.add_argument('--alpha', type=float, default=0.25, help="TaskRes alpha parameter to control text adaptation strength.")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--text_pool', type=str, choices=["mean", "lse"], default="mean", help="aggregate text prompts (mean or log-sum-exp).")
@@ -362,6 +372,8 @@ if __name__ == "__main__":
     if args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "dual_adapt": model_str = f"{args.model}_r{args.reduction}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "taskres": model_str = f"{args.model}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
+    elif args.model == "nl_taskres": model_str = f"{args.model}_r{args.reduction}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
+    elif args.model == "affine_taskres": model_str = f"{args.model}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}_{args.text_pool}"
     else: model_str = f"{args.model}_d{args.abmil_d}_{args.text_pool}"
 
@@ -471,6 +483,7 @@ if __name__ == "__main__":
             
             # Now saving xAI info for both Iteration 1 and Iteration 2
             if fold_idx in [1, 2] and n_seed == 0: 
+                xai_count = 0
                 for subj_id in eval_ids:
                     if subj_id in D_POOL and eval_preds.get(subj_id) == 1:
                         xai_infos.append({
@@ -479,6 +492,10 @@ if __name__ == "__main__":
                             "seed_idx": n_seed, 
                             "weights": b_weights
                         })
+                        xai_count += 1  
+                        
+                        if xai_count >= 5:
+                            break
         
         avg_val_bacc, std_val_bacc = np.mean(fold_val_bacc), np.std(fold_val_bacc)
         avg_test_bacc, std_test_bacc = np.mean(fold_test_bacc), np.std(fold_test_bacc)
@@ -492,11 +509,24 @@ if __name__ == "__main__":
         logging.info(log_str)
         combo_report_logs.append(f"Iter {fold_idx:02d}: Train:[{','.join(train_ids)}] | Test Subjects: [{len(test_ids)}] -> Test BACC: {avg_test_bacc:.4f} ± {std_test_bacc:.4f}")
             
+            
+    if args.model == "abmil_adapter": tmp_model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "zsmil": tmp_model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "taskres": tmp_model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "nl_taskres": tmp_model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "affine_taskres": tmp_model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "dual_adapt": tmp_model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
+    elif args.model == "max_pool": tmp_model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=args.alpha)
+    else: tmp_model = None
+
+    trainable_params = sum(p.numel() for p in tmp_model.parameters() if p.requires_grad) if tmp_model else 0
+            
     summary = (
-        f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - Visual Fusion - {args.shots} Shot)\n{'='*80}\n"
+        f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - {args.shots} Shot)\n{'='*80}\n"
         f"Average Epochs: {np.mean(flat_epochs):.1f} ± {np.std(flat_epochs):.1f}\n{'='*80}\n"
         f"INDIVIDUAL COMBO DETAILS:\n" + "\n".join(combo_report_logs) + f"\n{'='*80}\n"
         f"OVERALL METRICS (Across {args.iterations * args.seeds} Total Runs):\n"
+        f"Trainable Parameters: {trainable_params}\n"  # <-- THIS WAS MISSING
         f"Validation BACC: {np.mean(flat_val_baccs):.4f} ± {np.std(flat_val_baccs):.4f}\n"
         f"Test BACC:       {np.mean(flat_test_baccs):.4f} ± {np.std(flat_test_baccs):.4f}\n"
         f"Test AUC-ROC:    {np.mean(flat_test_aucs):.4f} ± {np.std(flat_test_aucs):.4f}\n"
