@@ -32,19 +32,19 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
     Reconstructs the specified model architecture for xAI evaluation.
     """
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
+        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, dropout_p=args.taskres_drop, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "nl_taskres":
-        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "affine_taskres":
-        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "dual_adapt":
-        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool)
+        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, num_healthy_prompts=args.num_healthy_prompts)
     else:
         raise ValueError(f"Unknown model type: {args.model}")
         
@@ -52,7 +52,7 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
 
 def compute_integrated_gradients(model, features, device, steps=50):
     """
-    Computes Integrated Gradients for baseline models lacking explicit attention mechanisms.
+    Computes Integrated Gradients for baseline models lacking attention mechanisms.
     """
     baseline = torch.zeros_like(features)
     avg_grads = torch.zeros_like(features)
@@ -78,8 +78,7 @@ def compute_integrated_gradients(model, features, device, steps=50):
 def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, device, features_dir, raw_wsis_map, results_dir, patch_size, level=0):
     """
     Executes the full xAI pipeline. Extracts highly weighted patches and regions,
-    passes them through the trained model, and verifies semantic alignment 
-    with the exact training concepts.
+    passes them through the trained model.
     """
     if not xai_infos:
         return
@@ -167,10 +166,9 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
             all_text_norm = F.normalize(all_text_feats, p=2, dim=-1)
             slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
             
-            # Compute similarities against ALL dynamically shifted prompts
+            # Compute similarities against shifted prompts
             text_sims = (slide_emb_norm @ all_text_norm.t()).squeeze()
             
-            # Extract the top 3 highest scores and their indices
             top_k = 3
             top_scores, top_indices = torch.topk(text_sims, k=top_k)
             
@@ -189,15 +187,13 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         
         Wl, Hl = slide.level_dimensions[level]
         
-        # --- Apply the cut-in-half logic to the xAI background ---
         full_thumb = slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor))
         thumb_arr = np.array(full_thumb.convert("RGB"))
         half_w_thumb = (Wl // 2) // thumb_factor
         thumb = thumb_arr[:, :half_w_thumb] # Crop visual to left half
         
         Wl = Wl // 2 
-        # ---------------------------------------------------------
-        
+
         heatmap_grid = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=np.float32)
         tissue_mask = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=bool) 
         p_size_thumb = patch_size // thumb_factor
@@ -246,9 +242,7 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         if xai_mode == "Visual-Attention":
             local_text_match = None
             
-            # If the model uses LSE pooling (has individual concept resolution), do Regional Computation
             if args.text_pool == "lse":
-                # 1. Re-locate the exact bounding box center (same math as xai_callout.py)
                 p_size_thumb = patch_size // thumb_factor
                 heatmap_smoothed_flat = scipy.ndimage.gaussian_filter(heatmap_grid, sigma=p_size_thumb)
                 max_ty, max_tx = np.unravel_index(np.argmax(heatmap_smoothed_flat), heatmap_smoothed_flat.shape)
@@ -261,7 +255,6 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                 zx_end = center_x + offset
                 zy_end = center_y + offset
                 
-                # 2. Find which patches fall inside this bounding box
                 local_features = []
                 for idx, (x, y) in enumerate(coords):
                     if zx_start <= x <= zx_end and zy_start <= y <= zy_end:
@@ -272,7 +265,6 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                     local_feats_tensor = torch.stack(local_features)
                     
                     with torch.no_grad(), torch.autocast(device_type=device.type):
-                        # Use the aggregator to pool just the local patches
                         local_emb, _ = model.aggregator(local_feats_tensor)
                         
                         # Apply Adapter if present
@@ -291,7 +283,6 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
 
                         text_msg += f"\n--- Regional Callout Semantic Match ---\n{local_text_match} (Sim: {best_local_score:.2f})\n"
                         
-            # 4. Generate the plot, passing the local text string if computed
             generate_zoomed_callout(
                 wsi_id=wsi_id,
                 slide_path=slide_path,
@@ -327,7 +318,7 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         plt.close()
         
         # ==========================================
-        # Slide-Level Reporting (Visual + Semantic)
+        # Slide-Level Reporting
         # ==========================================
         with open(out_dir / f"xai_report_{wsi_id}.txt", "w") as f:
             f.write("=====================================================\n")

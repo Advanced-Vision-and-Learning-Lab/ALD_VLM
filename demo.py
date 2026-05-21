@@ -23,7 +23,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Internal utility imports
 from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold, plot_and_save_curves
 from utils.xai import run_xai_analysis
 from utils.roc_plot import save_roc_curve
@@ -64,21 +63,19 @@ if CACHE_DIR.exists() and any(CACHE_DIR.iterdir()):
 
 PREFIXES = [
     "An H&E stained liver slide showing ",
-    "Microscopic evaluation of a liver slide revealing ",
     "Histopathological examination of a liver slide displaying "
 ]
 HEALTHY_MARKERS = [
-    "normal hepatocyte cords.", "clear hepatic sinusoids.", 
-    "intact portal tracts.", "normal central veins.", "uniform hepatocytes."
+    "orderly trabecular architecture.", "clear sinusoids.", 
+    "intact portal tracts.", "normal central veins.", "unremarkable parenchyma."
 ]
 ALD_MARKERS = [
-    "macrovesicular steatosis.", "microvesicular steatosis.", "hepatocyte ballooning.", 
-    "Mallory-Denk bodies.", "neutrophilic infiltrate.", "lobular inflammation.", 
-    "portal inflammation.", "pericellular fibrosis.", "bridging fibrosis.", "apoptotic bodies."
+    "macrovesicular steatosis.", "hepatocyte ballooning.", 
+    "Mallory-Denk bodies.", "neutrophilic infiltrate.", "pericellular fibrosis."
 ]
 BAG_PROMPTS = {
-    "Healthy Liver": [p + m for p in PREFIXES for m in HEALTHY_MARKERS], # 15 Prompts
-    "Alcoholic Liver Disease": [p + m for p in PREFIXES for m in ALD_MARKERS] # 30 Prompts
+    "Healthy Liver": [p + m for p in PREFIXES for m in HEALTHY_MARKERS], # 10 Prompts
+    "Alcoholic Liver Disease": [p + m for p in PREFIXES for m in ALD_MARKERS] # 10 Prompts
 }
 
 def set_seed(seed=42):
@@ -281,7 +278,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
         }, feature_out_path)
         
 # ==========================================
-# MAIN EXECUTION
+# MAIN
 # ==========================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -290,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument('--alpha', type=float, default=0.25, help="TaskRes alpha parameter to control text adaptation strength.")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--text_pool', type=str, choices=["mean", "lse"], default="mean", help="aggregate text prompts (mean or log-sum-exp).")
+    parser.add_argument('--taskres_drop', type=float, default=0.1, help="Dropout probability for TaskRes parameter.")
     parser.add_argument('--epochs', type=int, default=200, help="Max training epochs.")
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
     parser.add_argument('--reduction', type=int, default=8, help="Adapter bottleneck reduction factor.")
@@ -298,8 +296,10 @@ if __name__ == "__main__":
     parser.add_argument('--iterations', type=int, default=5, help="Number of random splits.")
     parser.add_argument('--dataset_pct', type=float, default=1.0, help="Percentage of total dataset to use.")
     parser.add_argument('--seeds', type=int, default=1, help="Random seeds per fold.") 
-    parser.add_argument('--patience', type=int, default=50, help="Early stopping patience.") 
+    parser.add_argument('--patience', type=int, default=25, help="Early stopping patience.") 
     args = parser.parse_args()
+    
+    args.num_healthy_prompts = len(BAG_PROMPTS["Healthy Liver"])
     
     args.accum_steps = args.shots * 2
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -459,7 +459,6 @@ if __name__ == "__main__":
 
             plot_and_save_curves(history, CURVES_DIR, fold_idx, n_seed)
 
-            # Save ROC Curve for the Test Set ---
             test_targets = [1 if subj in D_POOL else 0 for subj in test_ids]
             test_probs_list = [eval_probs.get(subj, 0.0) for subj in test_ids]
             
@@ -481,7 +480,6 @@ if __name__ == "__main__":
             flat_test_f1s.append(test_f1)
             flat_epochs.append(stopped_epoch)
             
-            # Now saving xAI info for both Iteration 1 and Iteration 2
             if fold_idx in [1, 2] and n_seed == 0: 
                 xai_count = 0
                 for subj_id in eval_ids:

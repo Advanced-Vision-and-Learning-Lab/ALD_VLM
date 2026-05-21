@@ -217,19 +217,19 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
     
     if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, dropout_p=args.taskres_drop, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "nl_taskres":
-        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "affine_taskres":
-        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "dual_adapt":
-        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool).to(device)
+        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
     elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, text_pool=args.text_pool).to(device)
+        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, num_healthy_prompts=args.num_healthy_prompts).to(device)
         
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     

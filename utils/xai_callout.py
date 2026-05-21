@@ -33,16 +33,13 @@ def generate_zoomed_callout(
     thumb_factor = 32
     
     Wl, Hl = slide.level_dimensions[level]
-    
-    # --- Apply the cut-in-half logic to the callout background ---
+
     thumb_arr = np.array(slide.get_thumbnail((Wl // thumb_factor, Hl // thumb_factor)).convert("RGB"))
     half_w_thumb = (Wl // 2) // thumb_factor
     thumb = thumb_arr[:, :half_w_thumb]
     
     Wl = Wl // 2
-    # -------------------------------------------------------------
 
-    # Reconstruct the spatial attention map and apply Gaussian smoothing 
     heatmap_grid = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=np.float32)
     tissue_mask = np.zeros((Hl // thumb_factor, Wl // thumb_factor), dtype=bool)
     p_size_thumb = patch_size // thumb_factor
@@ -67,12 +64,10 @@ def generate_zoomed_callout(
     overlay = cmap(heatmap_norm)
     overlay[..., 3] = np.where(tissue_mask, heatmap_norm * 0.6, 0.0)
 
-    # Identify the global maximum of the smoothed attention map
     max_ty, max_tx = np.unravel_index(np.argmax(heatmap_smoothed), heatmap_smoothed.shape)
     center_x = max_tx * thumb_factor
     center_y = max_ty * thumb_factor
 
-    # Compute bounding box coordinates
     offset = (zoom_window_patches // 2) * patch_size
     zx_start = max(0, center_x - offset)
     zy_start = max(0, center_y - offset)
@@ -82,18 +77,14 @@ def generate_zoomed_callout(
     read_w = zx_end - zx_start
     read_h = zy_end - zy_start
 
-    # Extract the high-resolution image crop
     zoomed_img = slide.read_region((int(zx_start), int(zy_start)), level, (int(read_w), int(read_h))).convert("RGB")
     
-    # Construct the side-by-side visualization figure.
     fig, axes = plt.subplots(1, 2, figsize=(18, 9), dpi=300, gridspec_kw={'width_ratios': [1, 1.2]})
     
-    # Left Panel: Global WSI Heatmap.
     ax_main = axes[0]
     ax_main.imshow(thumb)
     ax_main.imshow(overlay)
     
-    # Render bounding box
     rect_x, rect_y = zx_start // thumb_factor, zy_start // thumb_factor
     rect_w, rect_h = read_w // thumb_factor, read_h // thumb_factor
     

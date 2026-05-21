@@ -1,42 +1,48 @@
 #!/bin/bash
 
-# Configuration Arrays
-SHOTS=(1 4)
+SHOTS=(1 2 4)
 POOLS=("mean" "lse")
-MODELS=("zsmil" "abmil_adapter" "taskres" "dual_adapt")
+MODELS=("zsmil" "taskres")
 
-# Fixed Hyperparameters
-ABMIL_D=64
-REDUCTION=4
+ALPHA=0.25
+MAX_POOL_HEAD="none"
+EPOCHS=250
 LR=5e-4
+REDUCTION=4
+ABMIL_D=64
 ITERATIONS=10
+DATASET_PCT=1.0
 SEEDS=3
 PATIENCE=50
-EPOCHS=250
+TASKRES_DROP=0.1  
 
-echo "Starting Few-Shot WSI Experiments..."
+echo "Starting Few-Shot WSI Experiments (Exhaustive Arguments)..."
 
 for SHOT in "${SHOTS[@]}"; do
     for POOL in "${POOLS[@]}"; do
         for MODEL in "${MODELS[@]}"; do
             echo "======================================================================"
-            echo "Running: Model=$MODEL | Shots=$SHOT | Text Pool=$POOL"
+            echo "Running: Model=$MODEL | Shots=$SHOT | Pool=$POOL"
             echo "======================================================================"
 
             python demo.py \
                 --model "$MODEL" \
+                --alpha "$ALPHA" \
+                --max_pool_head "$MAX_POOL_HEAD" \
                 --text_pool "$POOL" \
-                --shots "$SHOT" \
-                --abmil_d "$ABMIL_D" \
-                --reduction "$REDUCTION" \
+                --epochs "$EPOCHS" \
                 --lr "$LR" \
+                --reduction "$REDUCTION" \
+                --abmil_d "$ABMIL_D" \
+                --shots "$SHOT" \
                 --iterations "$ITERATIONS" \
+                --dataset_pct "$DATASET_PCT" \
                 --seeds "$SEEDS" \
                 --patience "$PATIENCE" \
-                --epochs "$EPOCHS"
+                --taskres_drop "$TASKRES_DROP"
                 
         done
     done
 done
 
-echo "All experiments completed!"
+echo "All specified experiments completed!"
