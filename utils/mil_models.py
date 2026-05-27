@@ -171,7 +171,10 @@ class TaskResModel(nn.Module):
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         
-        self.task_res = nn.Parameter(torch.zeros_like(self.text_embeddings))
+        #self.task_res = nn.Parameter(torch.zeros_like(self.text_embeddings))
+        self.task_res = nn.Parameter(torch.empty_like(self.text_embeddings))
+        nn.init.normal_(self.task_res, mean=0.0, std=0.02)
+
         self.task_res_drop = nn.Dropout(p=dropout_p)
         
         self.text_pool = text_pool
@@ -290,16 +293,16 @@ class AffineTaskResModel(nn.Module):
     base text embeddings, allowing the model to stretch/mute features (Scale) 
     before translating them (Shift).
     """
-    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64, text_pool="mean"):
+    def __init__(self, text_embeddings, alpha=0.25, abmil_d=64, text_pool="mean", num_healthy_prompts=10):
         super().__init__()
         self.alpha = alpha
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.text_pool = text_pool
+        self.num_healthy_prompts = num_healthy_prompts
         self.aggregator = ABMIL(L=512, D=abmil_d)
 
         self.task_scale = nn.Parameter(torch.ones_like(self.text_embeddings))
-
         self.task_shift = nn.Parameter(torch.zeros_like(self.text_embeddings))
 
     def forward(self, features):
@@ -312,9 +315,9 @@ class AffineTaskResModel(nn.Module):
         
         raw_sims = embedding_norm @ prototype_norm.t()
         
-        pooled_sims = apply_text_pooling(raw_sims, self.text_pool)
+        pooled_sims = apply_text_pooling(raw_sims, self.text_pool, self.num_healthy_prompts)
         
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
         logits = pooled_sims * clamped_scale
         
-        return logits, embedding_norm, w    
+        return logits, embedding_norm, w

@@ -1,17 +1,20 @@
-"""
-generate_latex_table.py
-"""
-
 import os
 import re
 from pathlib import Path
 
 EXPERIMENTS = [
-    ("ZSMIL", "zsmil_d64"),
-    ("TaskRes ($\\alpha=0.25$)", "taskres_a0.25_d64")
+    ("Max Pool (Mean)", "max_pool_none_r4_mean"),
+    ("Max Pool (LSE)", "max_pool_none_r4_lse"),
+    ("ZSMIL (Mean)", "zsmil_d64_mean"),
+    ("ZSMIL (LSE)", "zsmil_d64_lse"),
+    ("ABMIL Adapter (Mean)", "abmil_adapter_r4_d64_mean"),
+    ("ABMIL Adapter (LSE)", "abmil_adapter_r4_d64_lse"),
+    ("ABMIL Adapter Dim 8 (Mean)", "abmil_adapter_r64_d64_mean"),
+    ("ABMIL Adapter Dim 8 (LSE)", "abmil_adapter_r64_d64_lse"),
+    ("TaskRes (Mean)", "taskres_a0.25_d64_mean"),
+    ("TaskRes (LSE)", "taskres_a0.25_d64_lse")
 ]
 
-POOLS = [("Mean", "mean"), ("LSE", "lse")]
 SHOTS = [1, 2, 4]
 ITERATIONS = 10
 STANDALONE_DIR = Path("outputs")
@@ -53,26 +56,26 @@ def build_latex_table():
     
     row_idx = 0
     for display_name, base_prefix in EXPERIMENTS:
-        for pool_display, pool_suffix in POOLS:
-            rows.append(f"{display_name} ({pool_display})")
-            
-            for shot in SHOTS:
-                folder_name = f"{base_prefix}_{pool_suffix}_{shot}shot_{ITERATIONS}iter"
-                filepath = STANDALONE_DIR / folder_name / "summary_metrics.txt"
-                metrics = parse_metrics(filepath)
+        rows.append(display_name)
+        
+        for shot in SHOTS:
+            folder_name = f"{base_prefix}_{shot}shot_{ITERATIONS}iter"
+            filepath = STANDALONE_DIR / folder_name / "summary_metrics.txt"
+            metrics = parse_metrics(filepath)
 
-                if shot == 1:
-                    if "params" not in results:
-                        results["params"] = {}
-                    results["params"][row_idx] = metrics.get('params') if metrics else None
+            if shot == SHOTS[0]:
+                if "params" not in results:
+                    results["params"] = {}
+                results["params"][row_idx] = metrics.get('params') if metrics else None
+        
+            # FIXED INDENTATION: This is now correctly inside the "for shot in SHOTS" loop
+            for metric_name in ['bacc', 'auc', 'f1']:
+                col_key = f"{shot}shot_{metric_name}"
+                if col_key not in results:
+                    results[col_key] = {}
+                results[col_key][row_idx] = metrics[metric_name] if metrics else None
                 
-                for metric_name in ['bacc', 'auc', 'f1']:
-                    col_key = f"{shot}shot_{metric_name}"
-                    if col_key not in results:
-                        results[col_key] = {}
-                    results[col_key][row_idx] = metrics[metric_name] if metrics else None
-                        
-            row_idx += 1
+        row_idx += 1
 
     best_indices = {}
     for col_key in results:
@@ -89,7 +92,7 @@ def build_latex_table():
         best_indices[col_key] = (top1_idx, top2_idx)
 
     latex = [
-        r"\begin{table}[hbt!]",
+        r"\begin{table*}[hbt!]",
         r"\centering",
         r"\caption{1, 2, and 4-Shot WSI Classification Performance comparing Mean vs. LSE Pooling.}",
         r"\label{tab:lse_ablation}",
@@ -104,7 +107,16 @@ def build_latex_table():
 
     for i, row_name in enumerate(rows):
         param_val = results.get("params", {}).get(i)
-        param_str = f"{param_val:.1f}" if param_val is not None else "-"
+        
+        # Format explicitly to drop '.0' if it is exactly 0.0 (for Max Pool)
+        if param_val is not None:
+            if param_val == 0.0:
+                param_str = "0"
+            else:
+                param_str = f"{param_val:.1f}"
+        else:
+            param_str = "-"
+            
         row_str = f"{row_name} & {param_str}"
         
         for shot in SHOTS:
@@ -133,7 +145,7 @@ def build_latex_table():
         r"\bottomrule",
         r"\end{tabular}",
         r"\end{adjustbox}",
-        r"\end{table}"
+        r"\end{table*}"
     ])
 
     return "\n".join(latex)

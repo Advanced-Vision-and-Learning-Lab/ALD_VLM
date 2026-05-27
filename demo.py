@@ -480,7 +480,8 @@ if __name__ == "__main__":
             flat_test_f1s.append(test_f1)
             flat_epochs.append(stopped_epoch)
             
-            if fold_idx in [1, 2] and n_seed == 0: 
+            #if fold_idx in [1, 2] and n_seed == 0:
+            if fold_idx == 1 and n_seed == 0:
                 xai_count = 0
                 for subj_id in eval_ids:
                     if subj_id in D_POOL and eval_preds.get(subj_id) == 1:
