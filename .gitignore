@@ -25,5 +25,12 @@ Thumbs.db
 # Test outputs
 *.log
 
+# Local experiment helpers and research notes
+/tests/
+/scripts/
+/docs/
+/generate_latex_table.py
+/generate_fig.py
+
 
 

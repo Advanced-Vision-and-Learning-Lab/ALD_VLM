@@ -9,6 +9,8 @@ import os
 import re
 import sys
 import random
+import json
+import importlib.metadata
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 
@@ -26,6 +28,9 @@ import matplotlib.pyplot as plt
 from utils.train_eval import WSIPatchDataset, load_or_create_splits, train_and_eval_fold, plot_and_save_curves
 from utils.xai import run_xai_analysis
 from utils.roc_plot import save_roc_curve
+from utils.conch_features import FEATURE_VERSION, tokenize_conch, sha256_file
+from utils.mil_models import BASELINE_MODELS, build_model
+from utils.augmentation import AUGMENTATION_VERSION, extract_augmented_features
 
 from utils.mil_models import (
     ABMILAdapterModel, 
@@ -45,7 +50,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 PROJECT_ROOT = Path(__file__).resolve().parent
 STANDALONE_DIR = PROJECT_ROOT / "outputs"
 PATCHES_DIR = STANDALONE_DIR / "patches"
-FEATURES_DIR = STANDALONE_DIR / "features"
+FEATURES_DIR = STANDALONE_DIR / "features_conch_v2"
 PREVIEWS_DIR = STANDALONE_DIR / "previews"
 
 for d in [PATCHES_DIR, FEATURES_DIR, PREVIEWS_DIR]:
@@ -53,7 +58,7 @@ for d in [PATCHES_DIR, FEATURES_DIR, PREVIEWS_DIR]:
 
 PATCH_SIZE = 224
 LEVEL = 0
-BATCH_SIZE = 256
+BATCH_SIZE = 32
 
 CACHE_DIR = PROJECT_ROOT / "models" / "cache_for_HF"
 os.environ.setdefault("HF_HOME", str(CACHE_DIR))
@@ -202,20 +207,52 @@ def _extract_patches_worker(slide_path):
             "subject_id": subject_id,
             "slide_name": slide_name
         }, out_pt)
+    else:
+        slide.close()
+        raise ValueError(f"No patches passed tissue/focus QC for subject {subject_id}.")
     
     slide.close()
 
 # ==========================================
 # FEATURE EXTRACTION
 # ==========================================
-def run_feature_extraction(device, valid_subjects, subject_meta):
+def run_feature_extraction(device, valid_subjects, subject_meta, text_pool):
+    conch_checkpoint = PROJECT_ROOT / "models" / "CONCH" / "pytorch_model.bin"
+    manifest_path = FEATURES_DIR / "extraction_manifest.json"
+    expected = {
+        "feature_version": FEATURE_VERSION,
+        "checkpoint_sha256": sha256_file(conch_checkpoint),
+        "prompts": BAG_PROMPTS,
+        "patch_size": PATCH_SIZE,
+        "level": LEVEL,
+        "image_projection": "contrastive",
+        "token_length": 128,
+        "patch_coordinate_sha256": {s: sha256_file(PATCHES_DIR / f"{s}_patches.pt") for s in valid_subjects},
+        "torch_version": torch.__version__,
+        "transformers_version": importlib.metadata.version("transformers"),
+    }
+    if manifest_path.exists():
+        existing = json.loads(manifest_path.read_text())
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise ValueError("Feature cache contract changed; move features_conch_v2 aside before extracting.")
+        if (all((FEATURES_DIR / f"{s}_features.pt").exists() for s in valid_subjects)
+                and (FEATURES_DIR / f"bag_embeddings_{text_pool}.npy").exists()
+                and (FEATURES_DIR / "training_text_embeddings.pt").exists()):
+            logging.info("Reusing validated CONCH v2 feature cache.")
+            return
+    elif any(FEATURES_DIR.glob("*_features.pt")):
+        raise ValueError("Feature files have no extraction manifest; refusing an unverified cache.")
     logging.info("Loading CONCH model for feature extraction...")
     from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer
-    conch_checkpoint = PROJECT_ROOT / "models" / "CONCH" / "pytorch_model.bin"
     model, processor = create_model_from_pretrained('conch_ViT-B-16', str(conch_checkpoint))
     model = model.to(device)
     model.eval()
     tokenizer = get_tokenizer()
+    expected["preprocess"] = str(processor)
+    expected["torch_version"] = torch.__version__
+    expected["transformers_version"] = importlib.metadata.version("transformers")
+    if not manifest_path.exists():
+        manifest_path.write_text(json.dumps(expected, indent=2) + "\n")
                 
     # Bag-Level Extraction
     bag_feats_list = []
@@ -225,20 +262,20 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
         for cls in ["Healthy Liver", "Alcoholic Liver Disease"]:
             cls_feats = []
             for prompt in BAG_PROMPTS[cls]:
-                inputs = tokenizer([prompt], padding="max_length", max_length=77, truncation=True, return_tensors="pt")
-                outputs = model.encode_text(inputs["input_ids"].to(device))
+                inputs = tokenize_conch(tokenizer, [prompt])
+                outputs = model.encode_text(inputs.to(device))
                 feat = F.normalize(outputs, p=2, dim=-1).squeeze(0).cpu().numpy()
                 cls_feats.append(feat)
                 text_to_feature_dict[prompt] = feat 
                 
-            if args.text_pool == "mean":
+            if text_pool == "mean":
                 cls_prototype = np.mean(cls_feats, axis=0)
                 bag_feats_list.append(cls_prototype / np.linalg.norm(cls_prototype))
             else:
-                for feat in cls_feats: # LSE mode saves all 45 un-averaged features
+                for feat in cls_feats:
                     bag_feats_list.append(feat / np.linalg.norm(feat))
     
-    np.save(FEATURES_DIR / f"bag_embeddings_{args.text_pool}.npy", np.stack(bag_feats_list))
+    np.save(FEATURES_DIR / f"bag_embeddings_{text_pool}.npy", np.stack(bag_feats_list))
     torch.save(text_to_feature_dict, FEATURES_DIR / "training_text_embeddings.pt")
     
     extracted_all = all((FEATURES_DIR / f"{s}_features.pt").exists() for s in valid_subjects)
@@ -259,22 +296,27 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
         slide_filename = data["slide_name"]
         
         slide_path = raw_wsis_dir / slide_filename
-        dataset = WSIPatchDataset(slide_path=slide_path, coords=coords, patch_size=PATCH_SIZE, level=LEVEL)
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+        if not len(coords):
+            raise ValueError(f"No retained patches for {subj_id}.")
+        dataset = WSIPatchDataset(slide_path=slide_path, coords=coords, patch_size=PATCH_SIZE, level=LEVEL, preprocess=processor)
+        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=4 if device.type == "cuda" else 0,
+                                pin_memory=device.type == "cuda")
         
         slide_feats = []
         with torch.no_grad():
             for pixel_values in dataloader:
                 pixel_values = pixel_values.to(device)
-                with torch.autocast(device_type=device.type):
-                    feats = model.encode_image(pixel_values)
+                with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                    feats = model.encode_image(pixel_values, proj_contrast=True, normalize=True)
                 slide_feats.append(F.normalize(feats, p=2, dim=-1).cpu().float().numpy())
                 
         torch.save({
             "features": torch.from_numpy(np.concatenate(slide_feats, axis=0)),
             "coords": coords, 
             "subject_id": subj_id,
-            "binary_category": "Healthy Liver" if subject_meta[subj_id]["category"] == "ND" else "Alcoholic Liver Disease"
+            "binary_category": "Non-Drinking" if subject_meta[subj_id]["category"] == "ND" else "Drinking",
+            "feature_version": FEATURE_VERSION,
         }, feature_out_path)
         
 # ==========================================
@@ -283,7 +325,7 @@ def run_feature_extraction(device, valid_subjects, subject_meta):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, choices=["abmil_adapter", "zsmil", "taskres",
-    "affine_taskres", "max_pool", "dual_adapt", "nl_taskres"], default="abmil_adapter")
+    "affine_taskres", "max_pool", "dual_adapt", "nl_taskres", *BASELINE_MODELS], default="abmil_adapter")
     parser.add_argument('--alpha', type=float, default=0.25, help="TaskRes alpha parameter to control text adaptation strength.")
     parser.add_argument('--max_pool_head', type=str, choices=["none", "adapter", "taskres"], default="none")
     parser.add_argument('--text_pool', type=str, choices=["mean", "lse"], default="mean", help="aggregate text prompts (mean or log-sum-exp).")
@@ -292,12 +334,22 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=3e-4, help="Learning rate.")
     parser.add_argument('--reduction', type=int, default=8, help="Adapter bottleneck reduction factor.")
     parser.add_argument('--abmil_d', type=int, default=64, help="ABMIL projection dimension.")
-    parser.add_argument('--shots', type=int, default=1, help="Samples per class for training.")
+    parser.add_argument('--shots', type=int, default=2, help="Samples per class for training.")
     parser.add_argument('--iterations', type=int, default=5, help="Number of random splits.")
     parser.add_argument('--dataset_pct', type=float, default=1.0, help="Percentage of total dataset to use.")
     parser.add_argument('--seeds', type=int, default=1, help="Random seeds per fold.") 
     parser.add_argument('--patience', type=int, default=25, help="Early stopping patience.") 
+    parser.add_argument('--results_root', type=Path, default=STANDALONE_DIR / "revalidated")
+    parser.add_argument('--skip_xai', action='store_true', help="Skip optional WSI visualizations.")
+    parser.add_argument('--augment', action='store_true', help="Use rotated/flipped and mildly stain-varied images for TRAINING subjects only.")
+    parser.add_argument('--aug_views', type=int, default=2, help="Number of cached augmented versions per training slide, in addition to the original.")
+    parser.add_argument('--aug_seed', type=int, default=42, help="Reproducible image-augmentation seed.")
+    parser.add_argument('--baseline_c', type=float, default=1.0, help="Inverse L2 regularization strength for the two logistic baselines.")
     args = parser.parse_args()
+    if (min(args.epochs, args.shots, args.iterations, args.seeds, args.patience, args.reduction, args.abmil_d) < 1
+            or args.aug_views < 1 or args.baseline_c <= 0
+            or not 0 < args.dataset_pct <= 1 or args.lr <= 0 or not 0 <= args.taskres_drop < 1):
+        parser.error("Counts/lr must be positive, dataset_pct in (0,1], and dropout in [0,1).")
     
     args.num_healthy_prompts = len(BAG_PROMPTS["Healthy Liver"])
     
@@ -349,7 +401,7 @@ if __name__ == "__main__":
         parts = line.strip().split()
         if len(parts) >= 5:
             subj_id, cohort, cat = parts[0], parts[2], parts[4]
-            SUBJECT_META[subj_id] = {"category": cat, "cohort": cohort}
+            SUBJECT_META[subj_id] = {"category": cat, "cohort": cohort, "sex": parts[3]}
             if cat == "ND": ND_POOL.append(subj_id)
             else: D_POOL.append(subj_id)
 
@@ -361,7 +413,7 @@ if __name__ == "__main__":
         D_POOL = rng.sample(D_POOL, d_keep)
         logging.info(f"Subsampled Dataset ({args.dataset_pct*100}%): {nd_keep} ND and {d_keep} D subjects.")
 
-    valid_subjects = set(ND_POOL + D_POOL)
+    valid_subjects = sorted(ND_POOL + D_POOL)
     selected_svs_filenames = [f"Coh{SUBJECT_META[s]['cohort']}_{s}_Nx_Liver_HE.svs" for s in valid_subjects]
     raw_wsis = {parse_subject_id(f): PROJECT_ROOT / "dataset" / "raw_wsis" / f for f in selected_svs_filenames}
 
@@ -369,7 +421,9 @@ if __name__ == "__main__":
     SHARED_SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     SPLITS_JSON_PATH = SHARED_SPLITS_DIR / f"dataset_splits_{args.shots}shot_{args.iterations}iter_{int(args.dataset_pct*100)}pct.json"
     
-    if args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}_{args.text_pool}"
+    if args.model == "mean_logreg": model_str = f"mean_logreg_c{args.baseline_c:g}"
+    elif args.model == "score_calibration": model_str = f"score_calibration_c{args.baseline_c:g}_{args.text_pool}"
+    elif args.model == "abmil_adapter": model_str = f"{args.model}_r{args.reduction}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "dual_adapt": model_str = f"{args.model}_r{args.reduction}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "taskres": model_str = f"{args.model}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
     elif args.model == "nl_taskres": model_str = f"{args.model}_r{args.reduction}_a{args.alpha}_d{args.abmil_d}_{args.text_pool}"
@@ -377,9 +431,28 @@ if __name__ == "__main__":
     elif args.model == "max_pool": model_str = f"{args.model}_{args.max_pool_head}_r{args.reduction}_{args.text_pool}"
     else: model_str = f"{args.model}_d{args.abmil_d}_{args.text_pool}"
 
-    DYNAMIC_RESULTS_DIR = STANDALONE_DIR / f"{model_str}_{args.shots}shot_{args.iterations}iter"
+    dataset_splits = load_or_create_splits(SPLITS_JSON_PATH, args.shots, ND_POOL, D_POOL, SUBJECT_META, args.iterations)
+    data_condition = "augmented" if args.augment else "raw"
+    DYNAMIC_RESULTS_DIR = args.results_root.resolve() / data_condition / f"{model_str}_{args.shots}shot_{args.iterations}iter"
+    augmentation_dir = (FEATURES_DIR.parent / f"{FEATURES_DIR.name}_aug{args.aug_views}_seed{args.aug_seed}") if args.augment else None
+    run_config = {
+        "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        "feature_version": FEATURE_VERSION,
+        "data_condition": data_condition,
+        "augmentation_version": AUGMENTATION_VERSION if args.augment else None,
+        "split_sha256": sha256_file(SPLITS_JSON_PATH),
+        "checkpoint_sha256": sha256_file(PROJECT_ROOT / "models/CONCH/pytorch_model.bin"),
+        "torch_version": torch.__version__,
+        "transformers_version": importlib.metadata.version("transformers"),
+        "sources": {name: sha256_file(PROJECT_ROOT / name) for name in
+                    ("demo.py", "utils/train_eval.py", "utils/mil_models.py", "utils/conch_features.py", "utils/xai.py", "utils/augmentation.py", "utils/baselines.py")},
+        "subjects": SUBJECT_META,
+    }
+    config_path = DYNAMIC_RESULTS_DIR / "run_config.json"
+    if config_path.exists() and json.loads(config_path.read_text()) != run_config:
+        raise ValueError("Existing run has a different configuration/code; use a new --results_root.")
 
-    if (DYNAMIC_RESULTS_DIR / "summary_metrics.txt").exists():
+    if (DYNAMIC_RESULTS_DIR / "summary_metrics.txt").exists() and config_path.exists():
         logging.info(f"Experiment {DYNAMIC_RESULTS_DIR.name} already exists and is complete. Skipping.")
         sys.exit(0)
     
@@ -389,19 +462,28 @@ if __name__ == "__main__":
     DYNAMIC_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     PROBS_DIR.mkdir(parents=True, exist_ok=True)
     CURVES_DIR.mkdir(parents=True, exist_ok=True) 
+    config_path.write_text(json.dumps(run_config, indent=2) + "\n")
 
     logging.info("Starting Processing Pipeline...")
     with ProcessPoolExecutor(max_workers=4) as ex:
         list(tqdm(ex.map(_extract_patches_worker, list(raw_wsis.values())), total=len(raw_wsis)))
         
-    run_feature_extraction(device, valid_subjects, SUBJECT_META)
+    run_feature_extraction(device, valid_subjects, SUBJECT_META, args.text_pool)
+    if args.augment:
+        # A subject may train in one split and test in another; only the fold's
+        # training loader can read these cached views. Evaluation always reads raw.
+        augmentation_subjects = sorted({sid for split in dataset_splits for sid in split["train_nd"] + split["train_d"]})
+        extract_augmented_features(
+            device, augmentation_subjects, FEATURES_DIR, PATCHES_DIR,
+            PROJECT_ROOT / "dataset/raw_wsis", PROJECT_ROOT / "models/CONCH/pytorch_model.bin",
+            augmentation_dir, num_views=args.aug_views, seed=args.aug_seed, batch_size=BATCH_SIZE,
+        )
     bag_embeddings = np.load(FEATURES_DIR / f"bag_embeddings_{args.text_pool}.npy")
     instance_embeddings = None  
     
     flat_val_baccs, flat_test_baccs, flat_test_aucs, flat_test_f1s, flat_epochs = [], [], [], [], []
     combo_report_logs, xai_infos = [], []
-    
-    dataset_splits = load_or_create_splits(SPLITS_JSON_PATH, args.shots, ND_POOL, D_POOL, SUBJECT_META, args.iterations)
+    run_metrics = []
     
     logging.info(f"Initiating Few-Shot Evaluation: {args.model.upper()} | {args.shots} Shots")
     
@@ -417,7 +499,7 @@ if __name__ == "__main__":
             val_bacc, test_bacc, test_auc, test_f1, stopped_epoch, eval_probs, eval_preds, eval_ids, b_weights, history = train_and_eval_fold(
                 train_ids=train_ids, val_ids=val_ids, test_ids=test_ids,
                 bag_embeddings=bag_embeddings, instance_embeddings=instance_embeddings, device=device, args=args,
-                features_dir=FEATURES_DIR
+                features_dir=FEATURES_DIR, augmentation_dir=augmentation_dir,
             )
 
             # --- Probability Reporting ---
@@ -433,7 +515,7 @@ if __name__ == "__main__":
                 f"Train Subjects: {', '.join(train_ids)}",
                 f"Val Subjects  : {', '.join(val_ids)}",
                 "============================================================",
-                f"{'Subject ID':<15} | {'True Label':<15} | {'Pred Label':<15} | {'Correct':<8} | {'Prob(Drinking)':<15} | {'Confidence'}",
+                f"{'Subject ID':<15} | {'Partition':<10} | {'True Label':<15} | {'Pred Label':<15} | {'Correct':<8} | {'Prob(Drinking)':<15} | {'Confidence'}",
                 "------------------------------------------------------------"
             ]
             
@@ -446,21 +528,71 @@ if __name__ == "__main__":
                 elif prob >= 0.6 or prob <= 0.4: conf_str = "Medium"
                 else: conf_str = "Low"
 
-                t_class = "ALD" if true_label == 1 else "Healthy"
-                p_class = "ALD" if pred_label == 1 else "Healthy"
+                partition = "validation" if subj in val_ids else "test"
+                t_class = "Drinking" if true_label == 1 else "Non-Drinking"
+                p_class = "Drinking" if pred_label == 1 else "Non-Drinking"
                 correct = "Yes" if true_label == pred_label else "No"
                 
-                txt_lines.append(f"{subj:<15} | {t_class:<15} | {p_class:<15} | {correct:<8} | {prob:<15.4f} | {conf_str}")
+                txt_lines.append(f"{subj:<15} | {partition:<10} | {t_class:<15} | {p_class:<15} | {correct:<8} | {prob:<15.4f} | {conf_str}")
 
             txt_lines.append("============================================================")
+            test_confusion = {
+                "true_positives": sum(sid in D_POOL and eval_preds[sid] == 1 for sid in test_ids),
+                "false_negatives": sum(sid in D_POOL and eval_preds[sid] == 0 for sid in test_ids),
+                "false_positives": sum(sid in ND_POOL and eval_preds[sid] == 1 for sid in test_ids),
+                "true_negatives": sum(sid in ND_POOL and eval_preds[sid] == 0 for sid in test_ids),
+            }
+            txt_lines.extend([
+                f"TEST drinking subjects correctly identified: {test_confusion['true_positives']}",
+                f"TEST drinking subjects missed: {test_confusion['false_negatives']}",
+                f"TEST controls incorrectly called drinking: {test_confusion['false_positives']}",
+                "Decision threshold: Prob(Drinking) >= 0.5",
+            ])
+            calibration_details = None
+            if args.model == "score_calibration":
+                weight = float(b_weights["classifier.weight"].item())
+                calibration_details = {
+                    "weight": weight, "bias": float(b_weights["classifier.bias"].item()),
+                    "score_center": float(b_weights["feature_center"].item()),
+                    "score_scale": float(b_weights["feature_scale"].item()),
+                    "direction_learned_from_training": "opposite" if weight < 0 else "same" if weight > 0 else "constant",
+                }
+                txt_lines.append(f"Score direction learned from TRAINING subjects: {calibration_details['direction_learned_from_training']}")
             
             with open(PROBS_DIR / f"iter{fold_idx:02d}_seed{n_seed}.txt", "w") as f:
                 f.write("\n".join(txt_lines))
 
+            predictions = [
+                {"subject_id": sid, "partition": "validation" if sid in val_ids else "test",
+                 "target": int(sid in D_POOL), "prediction": eval_preds[sid],
+                 "prob_drinking": eval_probs[sid], **SUBJECT_META[sid]}
+                for sid in eval_ids
+            ]
+            record = {
+                "iteration": fold_idx, "seed": n_seed, "train_ids": train_ids,
+                "val_ids": val_ids, "test_ids": test_ids, "predictions": predictions,
+                "metrics": {"val_bacc": val_bacc, "test_bacc": test_bacc,
+                            "test_auc": test_auc, "test_f1": test_f1,
+                            "reversed_test_auc_diagnostic": 1.0 - test_auc},
+                "best_epoch": int(np.argmin(history["val_loss"]) + 1),
+                "stopped_epoch": stopped_epoch, "history": history,
+                "data_condition": data_condition,
+                "class_counts": {phase: {"non_drinking": sum(sid in ND_POOL for sid in ids),
+                                         "drinking": sum(sid in D_POOL for sid in ids)}
+                                 for phase, ids in (("train", train_ids), ("validation", val_ids), ("test", test_ids))},
+                "test_confusion": test_confusion,
+                "calibration": calibration_details,
+            }
+            (PROBS_DIR / f"iter{fold_idx:02d}_seed{n_seed}.json").write_text(json.dumps(record, indent=2) + "\n")
+            checkpoint_dir = DYNAMIC_RESULTS_DIR / "checkpoints"
+            checkpoint_dir.mkdir(exist_ok=True)
+            torch.save(b_weights, checkpoint_dir / f"iter{fold_idx:02d}_seed{n_seed}.pt")
+            run_metrics.append({"iteration": fold_idx, "seed": n_seed, **record["metrics"]})
+
             plot_and_save_curves(history, CURVES_DIR, fold_idx, n_seed)
 
             test_targets = [1 if subj in D_POOL else 0 for subj in test_ids]
-            test_probs_list = [eval_probs.get(subj, 0.0) for subj in test_ids]
+            test_probs_list = [eval_probs[subj] for subj in test_ids]
             
             roc_save_path = CURVES_DIR / f"roc_curve_iter{fold_idx:02d}_seed{n_seed}.png"
             save_roc_curve(
@@ -480,22 +612,12 @@ if __name__ == "__main__":
             flat_test_f1s.append(test_f1)
             flat_epochs.append(stopped_epoch)
             
-            #if fold_idx in [1, 2] and n_seed == 0:
-            if fold_idx == 1 and n_seed == 0:
-                xai_count = 0
-                for subj_id in eval_ids:
-                    if subj_id in D_POOL and eval_preds.get(subj_id) == 1:
-                        xai_infos.append({
-                            "wsi_id": subj_id, 
-                            "combo_idx": fold_idx, 
-                            "seed_idx": n_seed, 
-                            "weights": b_weights
-                        })
-                        xai_count += 1  
-                        
-                        if xai_count >= 5:
-                            break
-        
+            # Choose test examples before looking at predictions; include both outcomes/classes.
+            if fold_idx == 1 and n_seed == 0 and not args.skip_xai and args.model not in ("max_pool", *BASELINE_MODELS):
+                for subj_id in sorted(split_info["test_nd"])[:2] + sorted(split_info["test_d"])[:2]:
+                    xai_infos.append({"wsi_id": subj_id, "combo_idx": fold_idx,
+                                      "seed_idx": n_seed, "weights": b_weights})
+
         avg_val_bacc, std_val_bacc = np.mean(fold_val_bacc), np.std(fold_val_bacc)
         avg_test_bacc, std_test_bacc = np.mean(fold_test_bacc), np.std(fold_test_bacc)
         avg_epochs, std_epochs = np.mean(fold_epochs), np.std(fold_epochs)
@@ -509,14 +631,7 @@ if __name__ == "__main__":
         combo_report_logs.append(f"Iter {fold_idx:02d}: Train:[{','.join(train_ids)}] | Test Subjects: [{len(test_ids)}] -> Test BACC: {avg_test_bacc:.4f} ± {std_test_bacc:.4f}")
             
             
-    if args.model == "abmil_adapter": tmp_model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "zsmil": tmp_model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "taskres": tmp_model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "nl_taskres": tmp_model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "affine_taskres": tmp_model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "dual_adapt": tmp_model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool)
-    elif args.model == "max_pool": tmp_model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=args.alpha)
-    else: tmp_model = None
+    tmp_model = build_model(args, bag_embeddings)
 
     trainable_params = sum(p.numel() for p in tmp_model.parameters() if p.requires_grad) if tmp_model else 0
             
@@ -524,16 +639,15 @@ if __name__ == "__main__":
         f"\n{'='*80}\nFEW-SHOT EVALUATION SUMMARY (Model: {args.model.upper()} - {args.shots} Shot)\n{'='*80}\n"
         f"Average Epochs: {np.mean(flat_epochs):.1f} ± {np.std(flat_epochs):.1f}\n{'='*80}\n"
         f"INDIVIDUAL COMBO DETAILS:\n" + "\n".join(combo_report_logs) + f"\n{'='*80}\n"
-        f"OVERALL METRICS (Across {args.iterations * args.seeds} Total Runs):\n"
+        f"OVERALL METRICS (Across {args.iterations * args.seeds} Total Runs; descriptive SD, overlapping subjects):\n"
         f"Trainable Parameters: {trainable_params}\n"  # <-- THIS WAS MISSING
         f"Validation BACC: {np.mean(flat_val_baccs):.4f} ± {np.std(flat_val_baccs):.4f}\n"
         f"Test BACC:       {np.mean(flat_test_baccs):.4f} ± {np.std(flat_test_baccs):.4f}\n"
         f"Test AUC-ROC:    {np.mean(flat_test_aucs):.4f} ± {np.std(flat_test_aucs):.4f}\n"
         f"Test F1-Score:   {np.mean(flat_test_f1s):.4f} ± {np.std(flat_test_f1s):.4f}\n{'='*80}"
     )
+    (DYNAMIC_RESULTS_DIR / "run_metrics.json").write_text(json.dumps(run_metrics, indent=2) + "\n")
     print(summary)
-    with open(DYNAMIC_RESULTS_DIR / f"summary_metrics.txt", "w") as f: f.write(summary)
-    
     if xai_infos:
         run_xai_analysis(
             xai_infos=xai_infos, 
@@ -547,3 +661,8 @@ if __name__ == "__main__":
             patch_size=PATCH_SIZE, 
             level=LEVEL
         )
+    # Write the completion marker only after every requested artifact succeeds.
+    summary_path = DYNAMIC_RESULTS_DIR / "summary_metrics.txt"
+    temporary_summary = summary_path.with_suffix(".tmp")
+    temporary_summary.write_text(summary)
+    temporary_summary.replace(summary_path)

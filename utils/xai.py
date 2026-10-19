@@ -15,15 +15,7 @@ import matplotlib.pyplot as plt
 import openslide
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from .mil_models import (
-    ABMILAdapterModel,
-    ZSMILModel,
-    TaskResModel,
-    MaxPoolModel,
-    DualAdaptModel,
-    NLTaskResModel,
-    AffineTaskResModel
-)
+from .mil_models import MaxPoolModel, build_model
 
 from .xai_callout import generate_zoomed_callout 
 
@@ -31,29 +23,31 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
     """
     Reconstructs the specified model architecture for xAI evaluation.
     """
-    if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts)
-    elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, dropout_p=args.taskres_drop, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "nl_taskres":
-        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "affine_taskres":
-        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "dual_adapt":
-        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, num_healthy_prompts=args.num_healthy_prompts)
-    else:
-        raise ValueError(f"Unknown model type: {args.model}")
-        
-    return model.to(device)
+    return build_model(args, bag_embeddings).to(device)
+
+
+def concept_embeddings(model, concept_matrix):
+    """Prompt retrieval is descriptive; mean-mode residuals are class-level only."""
+    text = torch.as_tensor(concept_matrix, device=model.text_embeddings.device)
+    # Mean models learn two prototypes, not 20 independent prompt residuals.
+    # Retrieve against frozen prompts in that case, with an explicit report label.
+    if model.text_pool == "mean":
+        return F.normalize(text, p=2, dim=-1)
+    if hasattr(model, "task_scale"):
+        text = model.task_scale * text + model.alpha * model.task_shift
+    elif hasattr(model, "task_res"):
+        text = text + model.alpha * model.task_res
+    elif hasattr(model, "semantic_adapter"):
+        text = text + model.alpha * model.semantic_adapter(text)
+    return F.normalize(text, p=2, dim=-1)
+
 
 def compute_integrated_gradients(model, features, device, steps=50):
     """
     Computes Integrated Gradients for baseline models lacking attention mechanisms.
     """
+    if isinstance(model, MaxPoolModel):
+        raise ValueError("Zero-reference integrated gradients are invalid for this normalized Max Pool path; validate a reference before generating attributions.")
     baseline = torch.zeros_like(features)
     avg_grads = torch.zeros_like(features)
     
@@ -61,7 +55,7 @@ def compute_integrated_gradients(model, features, device, steps=50):
         alpha = i / steps
         step_feat = (baseline + alpha * (features - baseline)).detach().requires_grad_(True)
         
-        with torch.autocast(device_type=device.type):
+        with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             outputs = model(step_feat)
             logits = outputs[0]
             target_score = logits[0, 1] 
@@ -84,7 +78,8 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         return
 
     if args.model == "max_pool":
-        xai_mode = "Gradient-Based"
+        logging.warning("Skipping Max Pool xAI: zero-reference integrated gradients failed the completeness diagnostic.")
+        return
     else:
         xai_mode = "Visual-Attention"
     
@@ -123,11 +118,11 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
         
         # --- Importance Score Extraction ---
         if xai_mode == "Visual-Attention":
-            with torch.no_grad(), torch.autocast(device_type=device.type):
+            with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 outputs = model(features)
                 slide_emb = outputs[1]
                 w = outputs[2]
-                importance_scores = w.squeeze().cpu().numpy()
+                importance_scores = w.reshape(-1).float().cpu().numpy()
             
             sorted_scores = np.sort(importance_scores)[::-1]
             cum_scores = np.cumsum(sorted_scores)
@@ -135,35 +130,19 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
             total_p = len(importance_scores)
             pct_of_tissue = (patches_50 / total_p) * 100
             
-            mass_msg = (f"\n--- Decision Mass Diagnostics ---\n"
-                        f"To reach 50% of the total decision weight, the model relied on:\n"
+            mass_msg = (f"\n--- Attention Mass Diagnostics ---\n"
+                        f"To reach 50% of the total attention weight, the attention was concentrated on:\n"
                         f"{patches_50} out of {total_p} total patches ({pct_of_tissue:.2f}% of the tissue).\n")
         else:
             importance_scores = compute_integrated_gradients(model, features, device)
-            with torch.no_grad(), torch.autocast(device_type=device.type):
+            with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 outputs = model(features)
                 slide_emb = outputs[1]
-            mass_msg = "\n--- Decision Mass Diagnostics ---\nN/A for Gradient-Based methods.\n"
+            mass_msg = "\n--- Attention Mass Diagnostics ---\nN/A for Gradient-Based methods.\n"
             
         # --- Slide-Level Text Semantic Matching ---
-        with torch.no_grad(), torch.autocast(device_type=device.type):
-            all_text_feats = torch.tensor(concept_matrix).to(device)
-            
-            if hasattr(model, 'task_scale') and hasattr(model, 'task_shift'):
-                alpha = getattr(model, 'alpha', 0.25)
-                # Apply the exact affine transform from the forward pass
-                all_text_feats = (model.task_scale * all_text_feats) + (alpha * model.task_shift)
-            
-            if hasattr(model, 'task_res'):
-                alpha = getattr(model, 'alpha', 0.25)
-                all_text_feats = all_text_feats + alpha * model.task_res
-
-            elif hasattr(model, 'semantic_adapter'):
-                alpha = getattr(model, 'alpha', 0.25)
-                # Compute the forward pass of the text through the trained adapter
-                all_text_feats = all_text_feats + alpha * model.semantic_adapter(all_text_feats)
-
-            all_text_norm = F.normalize(all_text_feats, p=2, dim=-1)
+        with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+            all_text_norm = concept_embeddings(model, concept_matrix)
             slide_emb_norm = F.normalize(slide_emb, p=2, dim=-1)
             
             # Compute similarities against shifted prompts
@@ -172,7 +151,9 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
             top_k = 3
             top_scores, top_indices = torch.topk(text_sims, k=top_k)
             
-            text_msg = f"\n--- Top {top_k} Matched Semantic Concepts ---\n"
+            text_msg = ("\nPrompt retrieval is descriptive similarity, not lesion detection or causal attribution.\n"
+                        + ("Mean-mode retrieval uses frozen individual prompts; learned residuals belong to class prototypes.\n" if args.text_pool == "mean" else "")
+                        + f"\n--- Top {top_k} Matched Semantic Concepts ---\n")
             for rank, (score, idx) in enumerate(zip(top_scores.tolist(), top_indices.tolist())):
                 text_msg += (f"Rank {rank + 1}:\n"
                              f"  Concept: '{target_sentences[idx]}'\n"
@@ -264,7 +245,7 @@ def run_xai_analysis(xai_infos, args, bag_embeddings, instance_embeddings, devic
                     # 3. Aggregate local features
                     local_feats_tensor = torch.stack(local_features)
                     
-                    with torch.no_grad(), torch.autocast(device_type=device.type):
+                    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                         local_emb, _ = model.aggregator(local_feats_tensor)
                         
                         # Apply Adapter if present

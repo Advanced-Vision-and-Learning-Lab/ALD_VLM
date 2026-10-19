@@ -11,9 +11,14 @@ import torch.nn.functional as F
 def apply_text_pooling(logits, text_pool, num_healthy):
     """Pools text similarities to 2 classes if LogSumExp is enabled."""
     if text_pool == "mean":
+        if logits.shape[1] != 2:
+            raise ValueError("Mean pooling requires exactly two class prototypes.")
         return logits # Shape is already (N, 2)
-        
+    if text_pool != "lse":
+        raise ValueError(f"Unknown text pooling mode: {text_pool}")
     num_ald = logits.shape[1] - num_healthy
+    if num_healthy < 1 or num_ald < 1:
+        raise ValueError("LSE pooling requires at least one prompt in each class.")
     
     logit_healthy = torch.logsumexp(logits[:, :num_healthy], dim=1) - np.log(num_healthy)
     logit_ald = torch.logsumexp(logits[:, num_healthy:], dim=1) - np.log(num_ald)
@@ -50,10 +55,11 @@ class ABMIL(nn.Module):
         return torch.mm(w.t(), features), w
 
 class MaxPoolModel(nn.Module):
-    def __init__(self, text_embeddings, head_type="none", reduction=4, alpha=0.25, num_healthy_prompts=10):
+    def __init__(self, text_embeddings, head_type="none", reduction=4, alpha=0.25, num_healthy_prompts=10, text_pool="mean"):
         super().__init__()
         self.c_in = 512
         self.head_type = head_type
+        self.text_pool = text_pool
         self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(10.0))
         self.num_healthy_prompts = num_healthy_prompts
@@ -95,7 +101,7 @@ class MaxPoolModel(nn.Module):
         
         raw_sims = embedding_norm @ prototype_norm.t()
         
-        pooled_sims = apply_text_pooling(raw_sims, getattr(self, 'text_pool', "mean"), self.num_healthy_prompts)
+        pooled_sims = apply_text_pooling(raw_sims, self.text_pool, self.num_healthy_prompts)
         
         clamped_scale = torch.clamp(self.logit_scale, max=4.6052).exp()
         logits = pooled_sims * clamped_scale
@@ -321,3 +327,75 @@ class AffineTaskResModel(nn.Module):
         logits = pooled_sims * clamped_scale
         
         return logits, embedding_norm, w
+
+
+BASELINE_MODELS = ("mean_logreg", "score_calibration")
+
+
+class MeanLogisticModel(nn.Module):
+    """Frozen mean slide features + an L2-regularized binary linear classifier."""
+
+    def __init__(self, input_dim=512):
+        super().__init__()
+        self.register_buffer("feature_center", torch.zeros(input_dim))
+        self.register_buffer("feature_scale", torch.ones(input_dim))
+        self.classifier = nn.Linear(input_dim, 1)
+        nn.init.zeros_(self.classifier.weight)
+        nn.init.zeros_(self.classifier.bias)
+
+    def classifier_features(self, features):
+        return F.normalize(features.mean(dim=0, keepdim=True), dim=-1)
+
+    def forward(self, features):
+        representation = self.classifier_features(features)
+        decision = self.classifier((representation - self.feature_center) / self.feature_scale)
+        logits = torch.cat([torch.zeros_like(decision), decision], dim=1)
+        weights = features.new_full((len(features), 1), 1.0 / len(features))
+        return logits, representation, weights
+
+
+class ScoreCalibrationModel(MeanLogisticModel):
+    """Learn just weight and bias on the frozen Max Pool text-score difference.
+
+    A negative weight may be learned from TRAINING subjects. Neither test AUC
+    nor test labels choose the direction. No attention or adapter is trained.
+    """
+
+    def __init__(self, text_embeddings, text_pool="mean", num_healthy_prompts=10):
+        super().__init__(input_dim=1)
+        self.register_buffer("text_embeddings", torch.tensor(text_embeddings, dtype=torch.float32))
+        self.text_pool, self.num_healthy_prompts = text_pool, num_healthy_prompts
+
+    def classifier_features(self, features):
+        embedding = F.normalize(features.max(dim=0, keepdim=True).values, dim=-1)
+        similarities = embedding @ F.normalize(self.text_embeddings, dim=-1).t()
+        classes = apply_text_pooling(similarities, self.text_pool, self.num_healthy_prompts)
+        return classes[:, 1:2] - classes[:, :1]
+
+
+def build_model(args, text_embeddings):
+    """Use the identical architecture for training, parameter counts, and xAI."""
+    if args.model == "mean_logreg":
+        return MeanLogisticModel()
+    if args.model == "score_calibration":
+        return ScoreCalibrationModel(text_embeddings, args.text_pool, args.num_healthy_prompts)
+    common = dict(text_embeddings=text_embeddings, text_pool=args.text_pool,
+                  num_healthy_prompts=args.num_healthy_prompts)
+    if args.model == "max_pool":
+        return MaxPoolModel(**common, head_type=args.max_pool_head,
+                            reduction=args.reduction, alpha=args.alpha)
+    common["abmil_d"] = args.abmil_d
+    if args.model == "abmil_adapter":
+        return ABMILAdapterModel(**common, reduction=args.reduction)
+    if args.model == "zsmil":
+        return ZSMILModel(**common)
+    common["alpha"] = args.alpha
+    if args.model == "taskres":
+        return TaskResModel(**common, dropout_p=args.taskres_drop)
+    if args.model == "dual_adapt":
+        return DualAdaptModel(**common, reduction=args.reduction)
+    if args.model == "nl_taskres":
+        return NLTaskResModel(**common, reduction=args.reduction)
+    if args.model == "affine_taskres":
+        return AffineTaskResModel(**common)
+    raise ValueError(f"Unknown model: {args.model}")

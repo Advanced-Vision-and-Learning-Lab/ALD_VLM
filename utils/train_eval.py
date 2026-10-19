@@ -20,27 +20,25 @@ import openslide
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import matplotlib.pyplot as plt
 
-from .mil_models import (
-    ABMILAdapterModel, 
-    ZSMILModel, 
-    TaskResModel, 
-    MaxPoolModel, 
-    NLTaskResModel,
-    DualAdaptModel,
-    AffineTaskResModel
-)
+from .mil_models import BASELINE_MODELS, build_model
+from .augmentation import load_augmented_views
+from .baselines import fit_baseline
 
 class WSIPatchDataset(Dataset):
     """
     Dataset for loading Whole Slide Image (WSI) patches on the fly.
     Initializes OpenSlide objects per-worker for multiprocessing.
     """
-    def __init__(self, slide_path, coords, patch_size=224, level=0):
+    def __init__(self, slide_path, coords, patch_size=224, level=0, preprocess=None, augmentation=None):
+        if preprocess is None:
+            raise ValueError("Pass the image transform returned by CONCH's model loader.")
         self.slide_path = str(slide_path)
         self.coords = coords
         self.patch_size = patch_size
         self.level = level
         self.slide = None 
+        self.preprocess = preprocess
+        self.augmentation = augmentation
 
     def __len__(self):
         return len(self.coords)
@@ -51,31 +49,58 @@ class WSIPatchDataset(Dataset):
             
         x, y = self.coords[idx]
         
-        patch = np.array(
-            self.slide.read_region(
-                (x.item(), y.item()), 
-                self.level, 
-                (self.patch_size, self.patch_size)
-            ).convert("RGB")
-        )
-        
-        batch_ts = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
-        
-        pixel_values = (batch_ts - mean) / std
-        return pixel_values
+        patch = self.slide.read_region(
+            (x.item(), y.item()), self.level, (self.patch_size, self.patch_size)
+        ).convert("RGB")
+        if self.augmentation is not None:
+            patch = self.augmentation(patch, idx)
+        return self.preprocess(patch)
 
-def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, iterations=5):
+def validate_splits(splits, shots, nd_pool, d_pool, iterations):
+    """Reject stale, incomplete, mislabeled, or leaking subject-level partitions."""
+    if len(set(nd_pool)) != len(nd_pool) or len(set(d_pool)) != len(d_pool) or set(nd_pool) & set(d_pool):
+        raise ValueError("Subject pools must contain unique, disjoint IDs.")
+    if len(splits) != iterations:
+        raise ValueError("Cached split count differs from requested iterations.")
+    pools = {"nd": set(nd_pool), "d": set(d_pool)}
+    for index, split in enumerate(splits, 1):
+        if split["iteration"] != index:
+            raise ValueError("Split iteration IDs must be consecutive.")
+        phases = {}
+        for phase in ("train", "val", "test"):
+            phases[phase] = []
+            for cls, pool in pools.items():
+                ids = split[f"{phase}_{cls}"]
+                if len(ids) != len(set(ids)) or not set(ids) <= pool:
+                    raise ValueError(f"Invalid {phase}_{cls} IDs in split {index}.")
+                expected = shots if phase == "train" else min(shots, 4)
+                if phase != "test" and len(ids) != expected:
+                    raise ValueError(f"Wrong {phase}_{cls} size in split {index}.")
+                if phase == "test" and not ids:
+                    raise ValueError(f"Both test classes must be nonempty in split {index}.")
+                phases[phase].extend(ids)
+        all_ids = sum(phases.values(), [])
+        if len(all_ids) != len(set(all_ids)) or set(all_ids) != pools["nd"] | pools["d"]:
+            raise ValueError(f"Subject leakage or missing subjects in split {index}.")
+        if split["test_ids"] != phases["test"]:
+            raise ValueError(f"test_ids do not match the test partition in split {index}.")
+
+
+def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, iterations=5, split_seed=42):
+    if shots < 1 or iterations < 1 or min(len(nd_pool), len(d_pool)) <= shots + min(shots, 4):
+        raise ValueError("Need positive shots/iterations and at least one test subject per class.")
     if os.path.exists(json_path):
         logging.info(f"Loading existing dataset splits from {json_path}")
         with open(json_path, 'r') as f:
-            return json.load(f)
+            splits = json.load(f)
+        validate_splits(splits, shots, nd_pool, d_pool, iterations)
+        return splits
 
     logging.info(f"Creating new dataset splits (Shots: {shots}, Iterations: {iterations}) -> {json_path}")
     splits = []
     used_train_nd, used_train_d = set(), set()
     val_shots = min(shots, 4)
+    rng = random.Random(split_seed)
     
     def stratified_sample(avail_ids, num_samples):
         groups = {}
@@ -86,11 +111,11 @@ def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, itera
             groups[cat].append(sid)
 
         for cat in groups:
-            random.shuffle(groups[cat])
+            rng.shuffle(groups[cat])
 
         selected = []
         active_cats = list(groups.keys())
-        random.shuffle(active_cats) 
+        rng.shuffle(active_cats)
         
         while len(selected) < num_samples and active_cats:
             for cat in list(active_cats):
@@ -103,30 +128,30 @@ def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, itera
         return selected
 
     for i in range(iterations):
-        avail_nd = list(set(nd_pool) - used_train_nd)
+        avail_nd = sorted(set(nd_pool) - used_train_nd)
         if len(avail_nd) < shots:
             used_train_nd = set()
-            avail_nd = list(nd_pool)
+            avail_nd = sorted(nd_pool)
             
-        train_nd = random.sample(avail_nd, shots)
+        train_nd = rng.sample(avail_nd, shots)
         used_train_nd.update(train_nd)
 
-        avail_d = list(set(d_pool) - used_train_d)
+        avail_d = sorted(set(d_pool) - used_train_d)
         if len(avail_d) < shots:
             used_train_d = set()
-            avail_d = list(d_pool)
+            avail_d = sorted(d_pool)
             
         train_d = stratified_sample(avail_d, shots)
         used_train_d.update(train_d)
         
-        avail_val_nd = list(set(nd_pool) - set(train_nd))
-        val_nd = random.sample(avail_val_nd, val_shots)
+        avail_val_nd = sorted(set(nd_pool) - set(train_nd))
+        val_nd = rng.sample(avail_val_nd, val_shots)
         
-        avail_val_d = list(set(d_pool) - set(train_d))
+        avail_val_d = sorted(set(d_pool) - set(train_d))
         val_d = stratified_sample(avail_val_d, val_shots)
         
-        test_nd = list(set(nd_pool) - set(train_nd) - set(val_nd))
-        test_d = list(set(d_pool) - set(train_d) - set(val_d))
+        test_nd = sorted(set(nd_pool) - set(train_nd) - set(val_nd))
+        test_d = sorted(set(d_pool) - set(train_d) - set(val_d))
         
         splits.append({
             "iteration": i + 1,
@@ -139,15 +164,18 @@ def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, itera
             "test_ids": test_nd + test_d
         })
 
+    validate_splits(splits, shots, nd_pool, d_pool, iterations)
+    Path(json_path).parent.mkdir(parents=True, exist_ok=True)
     with open(json_path, 'w') as f:
         json.dump(splits, f, indent=4)
         
     return splits
 
 class DynamicWSIDataset(Dataset):
-    def __init__(self, subject_ids: List[str], features_dir: Path):
+    def __init__(self, subject_ids: List[str], features_dir: Path, augmentation_dir=None):
         self.subject_ids = subject_ids
         self.features_dir = features_dir
+        self.augmentation_dir = Path(augmentation_dir) if augmentation_dir is not None else None
         self.label_map = {
                     "Non-Drinking": 0, 
                     "Drinking": 1,
@@ -163,7 +191,17 @@ class DynamicWSIDataset(Dataset):
             map_location="cpu", 
             weights_only=False
         )
-        return data["features"], self.label_map[data["binary_category"]], self.subject_ids[idx]
+        features = data["features"]
+        if features.ndim != 2 or features.shape[0] < 1 or features.shape[1] != 512 or not torch.isfinite(features).all():
+            raise ValueError(f"Invalid feature bag for subject {self.subject_ids[idx]}.")
+        if self.augmentation_dir is not None:
+            views = load_augmented_views(
+                self.augmentation_dir / f"{self.subject_ids[idx]}_aug_features.pt", features, self.subject_ids[idx])
+            # Sample one complete original/augmented slide view per training visit.
+            choice = int(torch.randint(len(views) + 1, (1,)).item())
+            if choice:
+                features = views[choice - 1]
+        return features, self.label_map[data["binary_category"]], self.subject_ids[idx]
 
 def evaluate(model, loader, device, criterion):
     """
@@ -179,10 +217,12 @@ def evaluate(model, loader, device, criterion):
     with torch.no_grad():
         for feats, label, subj_ids in loader:
             label = label.to(device)
-            with torch.autocast(device_type=device.type):
-                outputs = model(feats.to(device).squeeze(0))
-                logits = outputs[0]
-                loss = criterion(logits, label)
+            # Evaluate in float32 so close probabilities retain their ROC ranking.
+            outputs = model(feats.to(device).squeeze(0))
+            logits = outputs[0].float()
+            if logits.shape != (1, 2) or not torch.isfinite(logits).all():
+                raise ValueError("Expected finite binary logits with shape (1, 2).")
+            loss = criterion(logits, label)
             run_loss += loss.item()
             
             probs = logits.softmax(dim=-1)
@@ -195,49 +235,59 @@ def evaluate(model, loader, device, criterion):
             
             subj_id = subj_ids[0]
             subject_preds[subj_id] = pred
-            subject_probs[subj_id] = round(prob_drinking, 4)
+            subject_probs[subj_id] = prob_drinking
             
+    if not targets:
+        raise ValueError("Cannot evaluate an empty partition.")
+    if len(set(targets)) != 2:
+        raise ValueError("ROC AUC requires both classes; do not substitute chance AUC.")
     avg_loss = run_loss / len(loader.dataset)
     bacc = sklearn.metrics.balanced_accuracy_score(targets, preds)
     f1 = sklearn.metrics.f1_score(targets, preds, zero_division=0)
     
-    try:
-        auc = sklearn.metrics.roc_auc_score(targets, prob_list)
-    except ValueError:
-        auc = 0.5000 
+    auc = sklearn.metrics.roc_auc_score(targets, prob_list)
         
     return avg_loss, bacc, auc, f1, subject_preds, subject_probs
         
-def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_embeddings, device, args, features_dir):
+def snapshot_state(model):
+    """Clone even on CPU: .cpu() alone shares storage with the live model."""
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_embeddings, device, args, features_dir, augmentation_dir=None):
     """
     Executes the training and evaluation loop for a single fold/iteration.
     """
-    train_loader = DataLoader(DynamicWSIDataset(train_ids, features_dir), batch_size=1, shuffle=True)
+    train_dataset = DynamicWSIDataset(train_ids, features_dir)
+    train_loader = DataLoader(DynamicWSIDataset(train_ids, features_dir, augmentation_dir), batch_size=1, shuffle=True)
+    train_eval_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
     val_loader   = DataLoader(DynamicWSIDataset(val_ids, features_dir), batch_size=1, shuffle=False)
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
     
-    if args.model == "abmil_adapter":
-        model = ABMILAdapterModel(text_embeddings=bag_embeddings, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "zsmil":
-        model = ZSMILModel(text_embeddings=bag_embeddings, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "taskres":
-        model = TaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, dropout_p=args.taskres_drop, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "nl_taskres":
-        model = NLTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, reduction=args.reduction, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "affine_taskres":
-        model = AffineTaskResModel(text_embeddings=bag_embeddings, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "dual_adapt":
-        model = DualAdaptModel(text_embeddings=bag_embeddings, reduction=args.reduction, alpha=args.alpha, abmil_d=args.abmil_d, text_pool=args.text_pool, num_healthy_prompts=args.num_healthy_prompts).to(device)
-    elif args.model == "max_pool":
-        model = MaxPoolModel(text_embeddings=bag_embeddings, head_type=args.max_pool_head, reduction=args.reduction, alpha=0.25, num_healthy_prompts=args.num_healthy_prompts).to(device)
-        
+    if args.epochs < 1:
+        raise ValueError("epochs must be positive")
+    model = build_model(args, bag_embeddings).to(device)
+    if args.model in BASELINE_MODELS:
+        fit_baseline(model, train_dataset, augmentation_dir,
+                     regularization_c=getattr(args, "baseline_c", 1.0))
+        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
+        train_loss, train_bacc, _, _, _, _ = evaluate(model, train_eval_loader, device, criterion)
+        val_loss, val_bacc, _, _, val_preds, val_probs = evaluate(model, val_loader, device, criterion)
+        _, test_bacc, test_auc, test_f1, test_preds, test_probs = evaluate(model, test_loader, device, criterion)
+        history = {"train_loss": [train_loss], "val_loss": [val_loss],
+                   "train_bacc": [train_bacc], "val_bacc": [val_bacc]}
+        return (val_bacc, test_bacc, test_auc, test_f1, 1, {**val_probs, **test_probs},
+                {**val_preds, **test_preds}, val_ids + test_ids, snapshot_state(model), history)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
-    
-    warmup_epochs = 20
-    warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-    cosine_sched = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
-    
+    # Keep the published 20-epoch warmup, while supporting short smoke runs.
+    warmup_epochs = min(20, max(0, args.epochs - 1))
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6)
+    if warmup_epochs:
+        warmup_sched = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
+    else:
+        scheduler = cosine_sched
+
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     criterion = torch.nn.CrossEntropyLoss(reduction="sum")
     
@@ -291,7 +341,7 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
         if not skip_lr_sched:
             scheduler.step()
         
-        train_loss, train_bacc, _, _, _, _ = evaluate(model, train_loader, device, criterion)
+        train_loss, train_bacc, _, _, _, _ = evaluate(model, train_eval_loader, device, criterion)
         val_loss, val_bacc, _, _, _, _ = evaluate(model, val_loader, device, criterion)
         
         history['train_loss'].append(train_loss)
@@ -305,7 +355,7 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
             patience_ctr = 0
             best_val_loss = val_loss
             best_val_bacc = val_bacc
-            best_weights = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_weights = snapshot_state(model)
         else:
             patience_ctr += 1
             if patience_ctr >= args.patience: 
