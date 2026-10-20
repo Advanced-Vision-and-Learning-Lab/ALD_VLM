@@ -1,4 +1,4 @@
-"""Fit the two small baselines using training subjects only."""
+"""Fit regularized linear classifiers using training subjects only."""
 
 from pathlib import Path
 

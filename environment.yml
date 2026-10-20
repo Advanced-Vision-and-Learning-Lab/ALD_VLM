@@ -53,7 +53,7 @@ dependencies:
       - certifi==2026.1.4
       - charset-normalizer==3.4.4
       - click==8.3.1
-      - conch==0.1.0
+      - conch @ git+https://github.com/mahmoodlab/CONCH.git@141cc09c7d4ff33d8eda562bd75169b457f71a62
       - contourpy==1.3.2
       - cuda-bindings==12.9.4
       - cuda-pathfinder==1.2.2
@@ -175,4 +175,3 @@ dependencies:
       - xxhash==3.6.0
       - yarg==0.1.9
       - yarl==1.22.0
-prefix: /home/amir.m/anaconda3/envs/ald-vlm-env

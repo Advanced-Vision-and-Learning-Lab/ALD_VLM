@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from .mil_models import BASELINE_MODELS, build_model
 from .augmentation import load_augmented_views
 from .baselines import fit_baseline
+from .contrastive import supervised_contrastive_loss, validate_supcon_options
 
 class WSIPatchDataset(Dataset):
     """
@@ -258,6 +259,11 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     """
     Executes the training and evaluation loop for a single fold/iteration.
     """
+    validate_supcon_options(args)
+    supcon_weight = getattr(args, "supcon_weight", 0.0)
+    supcon_temperature = getattr(args, "supcon_temperature", 0.1)
+    if supcon_weight and (len(set(train_ids)) != len(train_ids) or augmentation_dir is not None):
+        raise ValueError("Contrastive training requires distinct training animals and original image views.")
     train_dataset = DynamicWSIDataset(train_ids, features_dir)
     train_loader = DataLoader(DynamicWSIDataset(train_ids, features_dir, augmentation_dir), batch_size=1, shuffle=True)
     train_eval_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
@@ -279,7 +285,7 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
         return (val_bacc, test_bacc, test_auc, test_f1, 1, {**val_probs, **test_probs},
                 {**val_preds, **test_preds}, val_ids + test_ids, snapshot_state(model), history)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
-    # Keep the published 20-epoch warmup, while supporting short smoke runs.
+    # Limit the warmup to 20 epochs, leaving at least one cosine-schedule epoch.
     warmup_epochs = min(20, max(0, args.epochs - 1))
     cosine_sched = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=1e-6)
     if warmup_epochs:
@@ -299,6 +305,8 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     stopped_epoch = args.epochs
     
     history = {'train_loss': [], 'val_loss': [], 'train_bacc': [], 'val_bacc': []}
+    if supcon_weight:
+        history.update(objective_ce=[], objective_supcon=[], objective_total=[])
     pbar = tqdm(range(args.epochs), desc="Training Epochs", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
     remainder = len(train_loader) % actual_accum_steps
     
@@ -307,7 +315,36 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
         optimizer.zero_grad()
         skip_lr_sched = False
         
-        for i, (feats, label, _) in enumerate(train_loader):
+        if supcon_weight:
+            # Retain all training graphs for the joint animal-level objective.
+            embeddings, labels, classification_losses = [], [], []
+            for feats, label, _ in train_loader:
+                label = label.to(device)
+                with torch.autocast(device_type=device.type, enabled=scaler is not None):
+                    logits, embedding, _ = model(feats.to(device).squeeze(0))
+                    classification_losses.append(criterion(logits, label))
+                embeddings.append(embedding)
+                labels.append(label)
+            loss_ce = torch.stack(classification_losses).mean()
+            loss_supcon = supervised_contrastive_loss(
+                torch.cat(embeddings, dim=0), torch.cat(labels), supcon_temperature,
+            )
+            loss = loss_ce + supcon_weight * loss_supcon
+            if scaler:
+                scaler.scale(loss).backward()
+                scale_before = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                skip_lr_sched = scale_before > scaler.get_scale()
+            else:
+                loss.backward()
+                optimizer.step()
+            optimizer.zero_grad()
+            history['objective_ce'].append(float(loss_ce.detach()))
+            history['objective_supcon'].append(float(loss_supcon.detach()))
+            history['objective_total'].append(float(loss.detach()))
+
+        for i, (feats, label, _) in enumerate(train_loader if not supcon_weight else ()):
             is_last_chunk = (len(train_loader) - i) <= remainder
             current_divisor = remainder if (is_last_chunk and remainder > 0) else actual_accum_steps
         

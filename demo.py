@@ -31,6 +31,7 @@ from utils.roc_plot import save_roc_curve
 from utils.conch_features import FEATURE_VERSION, tokenize_conch, sha256_file
 from utils.mil_models import BASELINE_MODELS, build_model
 from utils.augmentation import AUGMENTATION_VERSION, extract_augmented_features
+from utils.contrastive import validate_supcon_options
 
 from utils.mil_models import (
     ABMILAdapterModel, 
@@ -339,17 +340,26 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_pct', type=float, default=1.0, help="Percentage of total dataset to use.")
     parser.add_argument('--seeds', type=int, default=1, help="Random seeds per fold.") 
     parser.add_argument('--patience', type=int, default=25, help="Early stopping patience.") 
-    parser.add_argument('--results_root', type=Path, default=STANDALONE_DIR / "revalidated")
+    parser.add_argument('--results_root', type=Path, default=STANDALONE_DIR / "experiments",
+                        help="Directory for experiment results.")
     parser.add_argument('--skip_xai', action='store_true', help="Skip optional WSI visualizations.")
     parser.add_argument('--augment', action='store_true', help="Use rotated/flipped and mildly stain-varied images for TRAINING subjects only.")
     parser.add_argument('--aug_views', type=int, default=2, help="Number of cached augmented versions per training slide, in addition to the original.")
     parser.add_argument('--aug_seed', type=int, default=42, help="Reproducible image-augmentation seed.")
     parser.add_argument('--baseline_c', type=float, default=1.0, help="Inverse L2 regularization strength for the two logistic baselines.")
+    parser.add_argument('--supcon_weight', type=float, default=0.0,
+                        help="Supervised contrastive loss weight; 0 preserves classification-only training.")
+    parser.add_argument('--supcon_temperature', type=float, default=0.1,
+                        help="Temperature for cosine similarities between training animals.")
     args = parser.parse_args()
     if (min(args.epochs, args.shots, args.iterations, args.seeds, args.patience, args.reduction, args.abmil_d) < 1
             or args.aug_views < 1 or args.baseline_c <= 0
             or not 0 < args.dataset_pct <= 1 or args.lr <= 0 or not 0 <= args.taskres_drop < 1):
         parser.error("Counts/lr must be positive, dataset_pct in (0,1], and dropout in [0,1).")
+    try:
+        validate_supcon_options(args)
+    except ValueError as error:
+        parser.error(str(error))
     
     args.num_healthy_prompts = len(BAG_PROMPTS["Healthy Liver"])
     
@@ -433,6 +443,9 @@ if __name__ == "__main__":
 
     dataset_splits = load_or_create_splits(SPLITS_JSON_PATH, args.shots, ND_POOL, D_POOL, SUBJECT_META, args.iterations)
     data_condition = "augmented" if args.augment else "raw"
+    if args.supcon_weight > 0:
+        data_condition = "contrastive"
+        model_str += f"_supcon_w{args.supcon_weight:g}_t{args.supcon_temperature:g}"
     DYNAMIC_RESULTS_DIR = args.results_root.resolve() / data_condition / f"{model_str}_{args.shots}shot_{args.iterations}iter"
     augmentation_dir = (FEATURES_DIR.parent / f"{FEATURES_DIR.name}_aug{args.aug_views}_seed{args.aug_seed}") if args.augment else None
     run_config = {
@@ -445,7 +458,7 @@ if __name__ == "__main__":
         "torch_version": torch.__version__,
         "transformers_version": importlib.metadata.version("transformers"),
         "sources": {name: sha256_file(PROJECT_ROOT / name) for name in
-                    ("demo.py", "utils/train_eval.py", "utils/mil_models.py", "utils/conch_features.py", "utils/xai.py", "utils/augmentation.py", "utils/baselines.py")},
+                    ("demo.py", "utils/train_eval.py", "utils/mil_models.py", "utils/conch_features.py", "utils/xai.py", "utils/augmentation.py", "utils/baselines.py", "utils/contrastive.py")},
         "subjects": SUBJECT_META,
     }
     config_path = DYNAMIC_RESULTS_DIR / "run_config.json"
@@ -577,6 +590,7 @@ if __name__ == "__main__":
                 "best_epoch": int(np.argmin(history["val_loss"]) + 1),
                 "stopped_epoch": stopped_epoch, "history": history,
                 "data_condition": data_condition,
+                "contrastive": {"weight": args.supcon_weight, "temperature": args.supcon_temperature},
                 "class_counts": {phase: {"non_drinking": sum(sid in ND_POOL for sid in ids),
                                          "drinking": sum(sid in D_POOL for sid in ids)}
                                  for phase, ids in (("train", train_ids), ("validation", val_ids), ("test", test_ids))},
