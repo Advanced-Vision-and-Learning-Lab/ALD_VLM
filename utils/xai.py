@@ -27,10 +27,9 @@ def _initialize_xai_model(args, bag_embeddings, instance_embeddings, device):
 
 
 def concept_embeddings(model, concept_matrix):
-    """Prompt retrieval is descriptive; mean-mode residuals are class-level only."""
+    """Return normalized prompt embeddings for patch-to-text comparisons."""
     text = torch.as_tensor(concept_matrix, device=model.text_embeddings.device)
-    # Mean models learn two prototypes, not 20 independent prompt residuals.
-    # Retrieve against frozen prompts in that case, with an explicit report label.
+    # Mean pooling adapts class embeddings; individual prompts remain frozen.
     if model.text_pool == "mean":
         return F.normalize(text, p=2, dim=-1)
     if hasattr(model, "task_scale"):

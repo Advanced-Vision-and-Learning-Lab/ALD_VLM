@@ -85,7 +85,7 @@ BAG_PROMPTS = {
 }
 
 def set_seed(seed=42):
-    """Ensures deterministic behavior across runs."""
+    """Seed the Python, NumPy, and PyTorch random number generators."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -626,7 +626,7 @@ if __name__ == "__main__":
             flat_test_f1s.append(test_f1)
             flat_epochs.append(stopped_epoch)
             
-            # Choose test examples before looking at predictions; include both outcomes/classes.
+            # Select test animals by class and sorted ID, independent of predictions.
             if fold_idx == 1 and n_seed == 0 and not args.skip_xai and args.model not in ("max_pool", *BASELINE_MODELS):
                 for subj_id in sorted(split_info["test_nd"])[:2] + sorted(split_info["test_d"])[:2]:
                     xai_infos.append({"wsi_id": subj_id, "combo_idx": fold_idx,

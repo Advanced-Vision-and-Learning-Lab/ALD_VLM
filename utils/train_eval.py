@@ -58,7 +58,7 @@ class WSIPatchDataset(Dataset):
         return self.preprocess(patch)
 
 def validate_splits(splits, shots, nd_pool, d_pool, iterations):
-    """Reject stale, incomplete, mislabeled, or leaking subject-level partitions."""
+    """Check subject IDs, class counts, and train/validation/test separation."""
     if len(set(nd_pool)) != len(nd_pool) or len(set(d_pool)) != len(d_pool) or set(nd_pool) & set(d_pool):
         raise ValueError("Subject pools must contain unique, disjoint IDs.")
     if len(splits) != iterations:
@@ -198,7 +198,7 @@ class DynamicWSIDataset(Dataset):
         if self.augmentation_dir is not None:
             views = load_augmented_views(
                 self.augmentation_dir / f"{self.subject_ids[idx]}_aug_features.pt", features, self.subject_ids[idx])
-            # Sample one complete original/augmented slide view per training visit.
+            # Randomly select the original or an augmented feature set for this slide.
             choice = int(torch.randint(len(views) + 1, (1,)).item())
             if choice:
                 features = views[choice - 1]

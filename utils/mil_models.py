@@ -355,11 +355,7 @@ class MeanLogisticModel(nn.Module):
 
 
 class ScoreCalibrationModel(MeanLogisticModel):
-    """Learn just weight and bias on the frozen Max Pool text-score difference.
-
-    A negative weight may be learned from TRAINING subjects. Neither test AUC
-    nor test labels choose the direction. No attention or adapter is trained.
-    """
+    """Fit a linear classifier to the difference between Max Pool class scores."""
 
     def __init__(self, text_embeddings, text_pool="mean", num_healthy_prompts=10):
         super().__init__(input_dim=1)
@@ -374,7 +370,7 @@ class ScoreCalibrationModel(MeanLogisticModel):
 
 
 def build_model(args, text_embeddings):
-    """Use the identical architecture for training, parameter counts, and xAI."""
+    """Construct the model specified by the command-line arguments."""
     if args.model == "mean_logreg":
         return MeanLogisticModel()
     if args.model == "score_calibration":

@@ -3,8 +3,7 @@
 Few-shot classification of drinking status from rhesus macaque liver whole-slide
 images in the Monkey Alcohol Tissue Research Resource (MATRR). The pipeline uses
 frozen CONCH image and text encoders, multiple instance learning (MIL), and
-optional visual adapters or text residuals. The prediction target is drinking
-status; it is not a histological diagnosis of alcohol-associated liver disease.
+optional visual adapters or text residuals.
 
 ## Installation
 
@@ -48,32 +47,17 @@ is controlled separately by `--abmil_d` and defaults to 64. Model choices includ
 Max Pool (`max_pool`), ABMIL (`zsmil`), ABMIL Adapter (`abmil_adapter`), and
 TaskRes (`taskres`). Text prompts support mean and log-sum-exp (`lse`) pooling.
 
-To add supervised contrastive loss, append:
-
-```text
---supcon_weight 0.1 --supcon_temperature 0.1
-```
-
-The objective is classification loss plus the weighted contrastive loss. Each
-training animal contributes one slide representation; same-class animals form
-positive pairs. Validation and test animals are excluded from this loss. No
-projection network or additional trainable parameters are introduced. This option
-requires at least two training animals per class and a trainable visual
-representation; frozen Max Pool without a visual adapter is unsupported. Joint
-contrastive training can require more GPU memory than classification-only
-training. Early stopping selects the lowest validation classification loss.
-
 ## Evaluation and outputs
 
 Each split assigns distinct animals to training, validation, and testing, with
 the requested number of animals per class in both training and validation.
 For this cohort, 2-shot uses 4 training, 4 validation, and 29 test animals;
-4-shot uses 8 training, 8 validation, and 21 test animals. Repeated splits reuse
-animals and do not constitute independent cohorts.
+4-shot uses 8 training, 8 validation, and 21 test animals. The same saved splits
+are used for all methods. Early stopping selects the lowest validation loss.
 
 New experiments default to `outputs/experiments/`; `--results_root` selects
-another directory. Classification-only results are stored under `raw/`, and
-contrastive results under `contrastive/`. Each experiment records its settings,
+another directory. Classification results are stored under `raw/`.
+Each experiment records its settings,
 source hashes, metrics, predictions, checkpoints, learning curves, and ROC curves.
 Attention-based models also produce whole-slide visualizations unless
 `--skip_xai` is specified.
@@ -82,8 +66,6 @@ Feature caches are stored in `outputs/features_conch_v2/` with extraction
 metadata. Saved subject splits are reused across methods. Configuration checks
 prevent incompatible experiments from overwriting existing results.
 
-Reported metrics are balanced accuracy, ROC AUC, and positive-class F1. Run-level
-standard deviations describe variability across overlapping splits and seeds;
-they are not confidence intervals over independent animals. Attention maps
-visualize model aggregation weights and require separate validation for
-histological interpretation.
+Reported metrics are balanced accuracy, ROC AUC, and F1 score. Summary files
+contain the mean and standard deviation across splits and seeds. Attention maps
+show the weight assigned to each tissue patch during slide classification.

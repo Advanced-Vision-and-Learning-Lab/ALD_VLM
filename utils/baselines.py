@@ -27,7 +27,7 @@ def fit_baseline(model, train_dataset, augmentation_dir=None, regularization_c=1
             augmented.append(subject_views)
     if set(targets) != {0, 1}:
         raise ValueError("Baseline fitting requires both TRAINING classes.")
-    # No validation/test subject, or their augmented images, enters this scaler.
+    # Fit feature scaling on original training slides.
     scaler = StandardScaler().fit(np.asarray(originals))
     representations, labels, sample_weights = [], [], []
     for original, views, label in zip(originals, augmented, targets):
@@ -35,7 +35,7 @@ def fit_baseline(model, train_dataset, augmentation_dir=None, regularization_c=1
         for view in subject_views:
             representations.append(view)
             labels.append(label)
-            # Extra images must not multiply an animal's contribution or weaken L2.
+            # Give each animal a total sample weight of one across its image views.
             sample_weights.append(1.0 / len(subject_views))
     classifier = LogisticRegression(C=regularization_c, solver="lbfgs", max_iter=5000,
                                     tol=1e-8, random_state=0)
