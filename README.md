@@ -1,4 +1,11 @@
-# Parameter-Efficient Vision–Language Modeling for Liver Histology
+# Predicting Ethanol Drinking Status from Nonhuman Primate Liver Histology: A Proof of Concept for Parameter-efficient Fine-tuning in Few-Shot Vision-Language Modeling
+
+<p align="center">
+  <img src="Figures/workflow.png" alt="Workflow Diagram">
+</p>
+
+Amirmohammad Mohammadi, Rupak Khadka2, Kathleen A. Grant2, Mary Lauren Benton3, and Joshua Peeples
+
 
 Few-shot classification of drinking status from rhesus macaque liver whole-slide
 images in the Monkey Alcohol Tissue Research Resource (MATRR). The pipeline uses
