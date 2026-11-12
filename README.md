@@ -12,6 +12,10 @@ images in the Monkey Alcohol Tissue Research Resource (MATRR). The pipeline uses
 frozen CONCH image and text encoders, multiple instance learning (MIL), and
 optional visual adapters or text residuals.
 
+## Data Availability
+
+The whole-slide image dataset used in this study is not included in this repository. Data may be made available upon reasonable request, subject to the applicable data access requirements and approvals.
+
 ## Installation
 
 ```bash
@@ -27,10 +31,6 @@ Conda environment used for development.
 ```text
 demo.py                         # Feature extraction, training, and evaluation
 utils/                          # Models, losses, data loading, and visualization
-dataset/raw_wsis/               # Input .svs whole-slide images
-models/CONCH/pytorch_model.bin  # CONCH checkpoint
-models/cache_for_HF/            # Hugging Face model and tokenizer cache
-outputs/                       # Features, subject splits, and experiment results
 ```
 
 The subject metadata in `demo.py` specifies the 37-animal cohort. Slide filenames
