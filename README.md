@@ -4,7 +4,7 @@
   <img src="Figures/workflow.png" alt="Workflow Diagram">
 </p>
 
-Amirmohammad Mohammadi, Rupak Khadka2, Kathleen A. Grant2, Mary Lauren Benton3, and Joshua Peeples
+Amirmohammad Mohammadi, Rupak Khadka, Kathleen A. Grant, Mary Lauren Benton, and Joshua Peeples
 
 
 Few-shot classification of drinking status from rhesus macaque liver whole-slide
@@ -76,3 +76,25 @@ prevent incompatible experiments from overwriting existing results.
 Reported metrics are balanced accuracy, ROC AUC, and F1 score. Summary files
 contain the mean and standard deviation across splits and seeds. Attention maps
 show the weight assigned to each tissue patch during slide classification.
+
+## License
+
+This source code is licensed under the license found in the [`LICENSE`](LICENSE) file in the root directory of this source tree.
+
+This product is Copyright (c) 2026 A. Mohammadi, R. Khadka, K. A. Grant, M. L. Benton, and J. Peeples. All rights reserved.
+
+## Citation
+
+If you use this work, please cite:
+
+### arXiv preprint
+
+```bibtex
+@article{mohammadi2026predicting,
+  title={Predicting Ethanol Drinking Status from Nonhuman Primate Liver Histology: A Proof of Concept for Parameter-efficient Fine-tuning in Few-Shot Vision-Language Modeling},
+  author={Mohammadi, Amirmohammad and Khadka, Rupak and Grant, Kathleen A. and Benton, Mary Lauren and Peeples, Joshua},
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2026}
+}
+```
+
