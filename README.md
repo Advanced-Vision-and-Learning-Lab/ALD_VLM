@@ -93,7 +93,7 @@ If you use this work, please cite:
 @article{mohammadi2026predicting,
   title={Predicting Ethanol Drinking Status from Nonhuman Primate Liver Histology: A Proof of Concept for Parameter-efficient Fine-tuning in Few-Shot Vision-Language Modeling},
   author={Mohammadi, Amirmohammad and Khadka, Rupak and Grant, Kathleen A. and Benton, Mary Lauren and Peeples, Joshua},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  journal={arXiv preprint arXiv:2611.17105},
   year={2026}
 }
 ```
