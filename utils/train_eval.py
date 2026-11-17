@@ -1,8 +1,4 @@
-"""
-train_eval.py
-Training, Evaluation, and Dataset Modules.
-Provides utilities for dataset handling, stratified splitting, and the main training/validation loops.
-"""
+"""Subject splitting, WSI datasets, and training and evaluation utilities."""
 
 import os
 import json
@@ -20,17 +16,14 @@ import openslide
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import matplotlib.pyplot as plt
 
-from .mil_models import BASELINE_MODELS, build_model
-from .augmentation import load_augmented_views
-from .baselines import fit_baseline
-from .contrastive import supervised_contrastive_loss, validate_supcon_options
+from .mil_models import build_model
 
 class WSIPatchDataset(Dataset):
     """
     Dataset for loading Whole Slide Image (WSI) patches on the fly.
     Initializes OpenSlide objects per-worker for multiprocessing.
     """
-    def __init__(self, slide_path, coords, patch_size=224, level=0, preprocess=None, augmentation=None):
+    def __init__(self, slide_path, coords, patch_size=224, level=0, preprocess=None):
         if preprocess is None:
             raise ValueError("Pass the image transform returned by CONCH's model loader.")
         self.slide_path = str(slide_path)
@@ -39,7 +32,6 @@ class WSIPatchDataset(Dataset):
         self.level = level
         self.slide = None 
         self.preprocess = preprocess
-        self.augmentation = augmentation
 
     def __len__(self):
         return len(self.coords)
@@ -53,8 +45,6 @@ class WSIPatchDataset(Dataset):
         patch = self.slide.read_region(
             (x.item(), y.item()), self.level, (self.patch_size, self.patch_size)
         ).convert("RGB")
-        if self.augmentation is not None:
-            patch = self.augmentation(patch, idx)
         return self.preprocess(patch)
 
 def validate_splits(splits, shots, nd_pool, d_pool, iterations):
@@ -173,10 +163,9 @@ def load_or_create_splits(json_path, shots, nd_pool, d_pool, subject_meta, itera
     return splits
 
 class DynamicWSIDataset(Dataset):
-    def __init__(self, subject_ids: List[str], features_dir: Path, augmentation_dir=None):
+    def __init__(self, subject_ids: List[str], features_dir: Path):
         self.subject_ids = subject_ids
         self.features_dir = features_dir
-        self.augmentation_dir = Path(augmentation_dir) if augmentation_dir is not None else None
         self.label_map = {
                     "Non-Drinking": 0, 
                     "Drinking": 1,
@@ -195,13 +184,6 @@ class DynamicWSIDataset(Dataset):
         features = data["features"]
         if features.ndim != 2 or features.shape[0] < 1 or features.shape[1] != 512 or not torch.isfinite(features).all():
             raise ValueError(f"Invalid feature bag for subject {self.subject_ids[idx]}.")
-        if self.augmentation_dir is not None:
-            views = load_augmented_views(
-                self.augmentation_dir / f"{self.subject_ids[idx]}_aug_features.pt", features, self.subject_ids[idx])
-            # Randomly select the original or an augmented feature set for this slide.
-            choice = int(torch.randint(len(views) + 1, (1,)).item())
-            if choice:
-                features = views[choice - 1]
         return features, self.label_map[data["binary_category"]], self.subject_ids[idx]
 
 def evaluate(model, loader, device, criterion):
@@ -251,21 +233,16 @@ def evaluate(model, loader, device, criterion):
     return avg_loss, bacc, auc, f1, subject_preds, subject_probs
         
 def snapshot_state(model):
-    """Clone even on CPU: .cpu() alone shares storage with the live model."""
+    """Copy checkpoint tensors without sharing storage with the live model."""
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
-def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_embeddings, device, args, features_dir, augmentation_dir=None):
+def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, device, args, features_dir):
     """
     Executes the training and evaluation loop for a single fold/iteration.
     """
-    validate_supcon_options(args)
-    supcon_weight = getattr(args, "supcon_weight", 0.0)
-    supcon_temperature = getattr(args, "supcon_temperature", 0.1)
-    if supcon_weight and (len(set(train_ids)) != len(train_ids) or augmentation_dir is not None):
-        raise ValueError("Contrastive training requires distinct training animals and original image views.")
     train_dataset = DynamicWSIDataset(train_ids, features_dir)
-    train_loader = DataLoader(DynamicWSIDataset(train_ids, features_dir, augmentation_dir), batch_size=1, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
     train_eval_loader = DataLoader(train_dataset, batch_size=1, shuffle=False)
     val_loader   = DataLoader(DynamicWSIDataset(val_ids, features_dir), batch_size=1, shuffle=False)
     test_loader  = DataLoader(DynamicWSIDataset(test_ids, features_dir), batch_size=1, shuffle=False)
@@ -273,17 +250,6 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     if args.epochs < 1:
         raise ValueError("epochs must be positive")
     model = build_model(args, bag_embeddings).to(device)
-    if args.model in BASELINE_MODELS:
-        fit_baseline(model, train_dataset, augmentation_dir,
-                     regularization_c=getattr(args, "baseline_c", 1.0))
-        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
-        train_loss, train_bacc, _, _, _, _ = evaluate(model, train_eval_loader, device, criterion)
-        val_loss, val_bacc, _, _, val_preds, val_probs = evaluate(model, val_loader, device, criterion)
-        _, test_bacc, test_auc, test_f1, test_preds, test_probs = evaluate(model, test_loader, device, criterion)
-        history = {"train_loss": [train_loss], "val_loss": [val_loss],
-                   "train_bacc": [train_bacc], "val_bacc": [val_bacc]}
-        return (val_bacc, test_bacc, test_auc, test_f1, 1, {**val_probs, **test_probs},
-                {**val_preds, **test_preds}, val_ids + test_ids, snapshot_state(model), history)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     # Limit the warmup to 20 epochs, leaving at least one cosine-schedule epoch.
     warmup_epochs = min(20, max(0, args.epochs - 1))
@@ -305,8 +271,6 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
     stopped_epoch = args.epochs
     
     history = {'train_loss': [], 'val_loss': [], 'train_bacc': [], 'val_bacc': []}
-    if supcon_weight:
-        history.update(objective_ce=[], objective_supcon=[], objective_total=[])
     pbar = tqdm(range(args.epochs), desc="Training Epochs", leave=False, bar_format='{l_bar}{bar:20}{r_bar}')
     remainder = len(train_loader) % actual_accum_steps
     
@@ -315,36 +279,7 @@ def train_and_eval_fold(train_ids, val_ids, test_ids, bag_embeddings, instance_e
         optimizer.zero_grad()
         skip_lr_sched = False
         
-        if supcon_weight:
-            # Retain all training graphs for the joint animal-level objective.
-            embeddings, labels, classification_losses = [], [], []
-            for feats, label, _ in train_loader:
-                label = label.to(device)
-                with torch.autocast(device_type=device.type, enabled=scaler is not None):
-                    logits, embedding, _ = model(feats.to(device).squeeze(0))
-                    classification_losses.append(criterion(logits, label))
-                embeddings.append(embedding)
-                labels.append(label)
-            loss_ce = torch.stack(classification_losses).mean()
-            loss_supcon = supervised_contrastive_loss(
-                torch.cat(embeddings, dim=0), torch.cat(labels), supcon_temperature,
-            )
-            loss = loss_ce + supcon_weight * loss_supcon
-            if scaler:
-                scaler.scale(loss).backward()
-                scale_before = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                skip_lr_sched = scale_before > scaler.get_scale()
-            else:
-                loss.backward()
-                optimizer.step()
-            optimizer.zero_grad()
-            history['objective_ce'].append(float(loss_ce.detach()))
-            history['objective_supcon'].append(float(loss_supcon.detach()))
-            history['objective_total'].append(float(loss.detach()))
-
-        for i, (feats, label, _) in enumerate(train_loader if not supcon_weight else ()):
+        for i, (feats, label, _) in enumerate(train_loader):
             is_last_chunk = (len(train_loader) - i) <= remainder
             current_divisor = remainder if (is_last_chunk and remainder > 0) else actual_accum_steps
         

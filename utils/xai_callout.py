@@ -1,7 +1,4 @@
-"""
-xai_callout.py
-Module for generating interpretability visualizations for Whole Slide Images (WSIs).
-"""
+"""Enlarged high-attention regions with whole-slide location markers."""
 
 import numpy as np
 import scipy.ndimage
@@ -19,7 +16,6 @@ def generate_zoomed_callout(
     patch_size,
     level,
     out_dir,
-    local_concept_text=None,
     zoom_window_patches=6
 ):
     """
@@ -108,8 +104,6 @@ def generate_zoomed_callout(
     ax_zoom.set_yticks([])
 
     title_text = "High Attention Region"
-    if local_concept_text:
-        title_text += f"\n\nLocal Concept Match:\n{local_concept_text}"
         
     ax_zoom.set_title(title_text, fontsize=14, color='darkred', fontweight='bold', pad=15)
 

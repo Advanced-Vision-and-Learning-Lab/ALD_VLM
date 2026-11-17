@@ -42,17 +42,17 @@ them to 448 × 448. Text inputs use CONCH's 128-position tokenization.
 
 ## Training
 
-For a 4-shot experiment with an adapter bottleneck of 128 and LSE text pooling:
+For a 4-shot experiment with an adapter bottleneck of 128:
 
 ```bash
-python demo.py --model abmil_adapter --reduction 4 --text_pool lse \
+python demo.py --model abmil_adapter --reduction 4 \
     --shots 4 --iterations 10 --seeds 3 --epochs 250 --lr 1e-3 --patience 50
 ```
 
 Use `--reduction 64` for an adapter bottleneck of 8. The MIL attention dimension
 is controlled separately by `--abmil_d` and defaults to 64. Model choices include
 Max Pool (`max_pool`), ABMIL (`zsmil`), ABMIL Adapter (`abmil_adapter`), and
-TaskRes (`taskres`). Text prompts support mean and log-sum-exp (`lse`) pooling.
+TaskRes (`taskres`). Text prompts use mean pooling, as described in the paper.
 
 ## Evaluation and outputs
 
