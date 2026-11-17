@@ -1,4 +1,4 @@
-"""MIL architectures used for drinking-status classification in the paper."""
+"""Multiple instance learning architectures for drinking-status classification."""
 
 import numpy as np
 import torch
